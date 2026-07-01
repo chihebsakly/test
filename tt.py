@@ -35,7 +35,7 @@ LOG_FILE = os.path.join(SCRIPT_DIR, "bot_expert.log")
 SCORE_MIN_ENTRY = 55    # Seuil minimum pour entrer
 SCORE_AGGRESSIVE = 80   # Seuil mode agressif
 MAX_POSITIONS = 1       # 1 seul trade a la fois
-STOP_LOSS_MAX = 7       # Perte max en $ (protection solde reel ~23$)
+STOP_LOSS_MAX = 15      # Perte max en $ (stop fixe -15$)
 COOLDOWN_SECONDS = 60   # Attente apres fermeture avant re-entrer
 MAX_SPREAD_USD = 60     # Spread max acceptable (XM = ~50$, marge de securite)
 MIN_SCORE_DIFF = 15     # Difference min entre BUY et SELL score
@@ -43,6 +43,8 @@ TRADE_HISTORY_FILE = os.path.join(SCRIPT_DIR, "trades_history.csv")
 MAX_CONSECUTIVE_LOSSES = 3   # Apres 3 pertes d'affilee, augmenter le seuil
 DAILY_LOSS_LIMIT = 12        # Arret si perte totale session >= 12$
 DAILY_PROFIT_TARGET = 20     # Objectif journalier (info seulement)
+FIXED_TP_AMOUNT = 4          # TP fixe en $ tant que solde < seuil
+FIXED_TP_BALANCE_LIMIT = 200 # Au-dessus de ce solde, TP dynamique reprend
 TIMEFRAME_CONFIRM = mt5.TIMEFRAME_M15  # Timeframe de confirmation
 TIMEFRAME_FOND = mt5.TIMEFRAME_M30     # Timeframe de fond (tendance generale)
 
@@ -1096,7 +1098,6 @@ class SignalGenerator:
 # RISK MANAGER - TP a 3 niveaux (1-5$ / 10-15$ / 25-30$)
 # ==============================================================
 class RiskManager:
-    SCORE_PEAK_PATIENCE = 3  # Nombre d'iterations a attendre pour confirmer le pic
 
     def __init__(self):
         self.entry_score = 0
@@ -1109,11 +1110,6 @@ class RiskManager:
         self.session_stopped = False # Session arretee (limite pertes)
         self.last_signal_dir = ""   # Derniere direction signalee
         self.signal_confirm_count = 0  # Compteur confirmation
-        # Peak detection
-        self.peak_score = 0         # Meilleur score vu
-        self.peak_direction = ""    # Direction du meilleur score
-        self.peak_signal = None     # Signal complet au pic
-        self.declining_count = 0    # Nombre d'iterations ou le score baisse
 
     def on_new_trade(self, signal: Signal):
         """Appele quand un nouveau trade est ouvert"""
@@ -1184,59 +1180,15 @@ class RiskManager:
         elapsed = time.time() - self.last_close_time
         return elapsed < COOLDOWN_SECONDS
 
-    def should_enter_now(self, signal: Signal) -> Tuple[bool, Signal, str]:
+    def can_enter(self, signal: Signal) -> Tuple[bool, str]:
         """
-        Detecte le MEILLEUR moment pour entrer.
-        Attend que le score atteigne un pic puis commence a baisser.
-        Retourne (entrer_maintenant, signal_a_utiliser, message)
+        Entree directe des que le score depasse le seuil adaptatif.
+        BTC M5 bouge trop vite pour attendre un pic.
         """
         score_min = self.get_adjusted_score_min()
-
-        # Signal sous le seuil = reset
         if signal.direction == "NONE" or signal.score < score_min:
-            if self.peak_score > 0:
-                msg = f"Signal perdu (score {signal.score} < {score_min}), reset peak"
-                self.peak_score = 0
-                self.peak_direction = ""
-                self.peak_signal = None
-                self.declining_count = 0
-                return False, signal, msg
-            return False, signal, "Score insuffisant"
-
-        # Direction a change = reset le peak
-        if signal.direction != self.peak_direction:
-            self.peak_score = signal.score
-            self.peak_direction = signal.direction
-            self.peak_signal = signal
-            self.declining_count = 0
-            return False, signal, f"Nouveau signal {signal.direction}, score={signal.score}, attente du pic"
-
-        # Score monte = nouveau pic
-        if signal.score >= self.peak_score:
-            self.peak_score = signal.score
-            self.peak_signal = signal
-            self.declining_count = 0
-            return False, signal, f"Score monte: {signal.score} (pic={self.peak_score}), attente"
-
-        # Score baisse = le pic est peut-etre passe
-        self.declining_count += 1
-
-        # Score tres haut (>= 90) = entrer vite, pas le temps d'attendre
-        if self.peak_score >= 90:
-            return True, self.peak_signal, f"Score pic {self.peak_score} >= 90, entree immediate"
-
-        # Score a baisse pendant PATIENCE iterations = pic confirme, entrer
-        if self.declining_count >= self.SCORE_PEAK_PATIENCE:
-            best_signal = self.peak_signal
-            msg = f"PIC DETECTE: {self.peak_score} -> {signal.score} (baisse x{self.declining_count})"
-            # Reset pour le prochain trade
-            self.peak_score = 0
-            self.peak_direction = ""
-            self.peak_signal = None
-            self.declining_count = 0
-            return True, best_signal, msg
-
-        return False, signal, f"Score baisse: {signal.score} (pic={self.peak_score}, attente {self.declining_count}/{self.SCORE_PEAK_PATIENCE})"
+            return False, f"Score {signal.score} < seuil {score_min}"
+        return True, f"Score {signal.score} >= seuil {score_min}, ENTREE DIRECTE"
 
     def cooldown_remaining(self) -> int:
         """Secondes restantes de cooldown"""
@@ -1277,7 +1229,13 @@ class RiskManager:
         if self.max_profit_seen >= 2 and profit <= 0:
             return True, f"Break-even: max vu +{self.max_profit_seen:.2f}$, retombe a {profit:.2f}$"
 
-        # === TAKE PROFIT selon force du signal ===
+        # === TP FIXE 4$ tant que solde < 200$ (construction du capital) ===
+        account = mt5.account_info()
+        if account and account.balance < FIXED_TP_BALANCE_LIMIT:
+            if profit >= FIXED_TP_AMOUNT:
+                return True, f"TP FIXE {FIXED_TP_AMOUNT}$: +{profit:.2f}$ (solde {account.balance:.0f}$ < {FIXED_TP_BALANCE_LIMIT}$)"
+
+        # === TAKE PROFIT dynamique (solde >= 200$) ===
         if self.entry_score >= SCORE_AGGRESSIVE:
             return self._tp_aggressive(pos, snap, profit)
         elif self.entry_score >= 70:
@@ -1905,25 +1863,25 @@ def main():
                     print(f"\n  CONFIRMATION: signal {signal.direction} vu "
                           f"{risk_mgr.signal_confirm_count}/2 fois (apres pertes)")
 
-                # Check 4: Attendre le meilleur score (peak detection)
+                # Check 4: Entree directe (BTC M5 = pas le temps d'attendre)
                 else:
-                    enter_now, best_signal, peak_msg = risk_mgr.should_enter_now(signal)
-                    print(f"\n  PEAK: {peak_msg}")
+                    can_enter, entry_msg = risk_mgr.can_enter(signal)
+                    print(f"\n  ENTRY: {entry_msg}")
 
-                    if enter_now:
-                        lot = risk_mgr.compute_lot(best_signal, snap.atr, snap.prix)
-                        success = executor.open_order(best_signal.direction, lot)
+                    if can_enter:
+                        lot = risk_mgr.compute_lot(signal, snap.atr, snap.prix)
+                        success = executor.open_order(signal.direction, lot)
                         if success:
-                            risk_mgr.on_new_trade(best_signal)
+                            risk_mgr.on_new_trade(signal)
                             risk_mgr.signal_confirm_count = 0
-                            print(f"  >>> TRADE OUVERT: {best_signal.direction} | Lot={lot} | Score={best_signal.score}")
+                            print(f"  >>> TRADE OUVERT: {signal.direction} | Lot={lot} | Score={signal.score}")
                             logger.info(
-                                f"OUVERTURE {best_signal.direction} | Score={best_signal.score} | "
-                                f"Scenarios={best_signal.scenario_count} | Lot={lot} | "
-                                f"Raisons: {'; '.join(best_signal.reasons[:5])}"
+                                f"OUVERTURE {signal.direction} | Score={signal.score} | "
+                                f"Scenarios={signal.scenario_count} | Lot={lot} | "
+                                f"Raisons: {'; '.join(signal.reasons[:5])}"
                             )
                         else:
-                            print(f"\n  !!! ECHEC OUVERTURE {best_signal.direction} (verifier MT5)")
+                            print(f"\n  !!! ECHEC OUVERTURE {signal.direction} (verifier MT5)")
             else:
                 # Afficher info
                 adj_min = risk_mgr.get_adjusted_score_min()
