@@ -1096,6 +1096,8 @@ class SignalGenerator:
 # RISK MANAGER - TP a 3 niveaux (1-5$ / 10-15$ / 25-30$)
 # ==============================================================
 class RiskManager:
+    SCORE_PEAK_PATIENCE = 3  # Nombre d'iterations a attendre pour confirmer le pic
+
     def __init__(self):
         self.entry_score = 0
         self.max_profit_seen = 0
@@ -1107,6 +1109,11 @@ class RiskManager:
         self.session_stopped = False # Session arretee (limite pertes)
         self.last_signal_dir = ""   # Derniere direction signalee
         self.signal_confirm_count = 0  # Compteur confirmation
+        # Peak detection
+        self.peak_score = 0         # Meilleur score vu
+        self.peak_direction = ""    # Direction du meilleur score
+        self.peak_signal = None     # Signal complet au pic
+        self.declining_count = 0    # Nombre d'iterations ou le score baisse
 
     def on_new_trade(self, signal: Signal):
         """Appele quand un nouveau trade est ouvert"""
@@ -1176,6 +1183,60 @@ class RiskManager:
             return False
         elapsed = time.time() - self.last_close_time
         return elapsed < COOLDOWN_SECONDS
+
+    def should_enter_now(self, signal: Signal) -> Tuple[bool, Signal, str]:
+        """
+        Detecte le MEILLEUR moment pour entrer.
+        Attend que le score atteigne un pic puis commence a baisser.
+        Retourne (entrer_maintenant, signal_a_utiliser, message)
+        """
+        score_min = self.get_adjusted_score_min()
+
+        # Signal sous le seuil = reset
+        if signal.direction == "NONE" or signal.score < score_min:
+            if self.peak_score > 0:
+                msg = f"Signal perdu (score {signal.score} < {score_min}), reset peak"
+                self.peak_score = 0
+                self.peak_direction = ""
+                self.peak_signal = None
+                self.declining_count = 0
+                return False, signal, msg
+            return False, signal, "Score insuffisant"
+
+        # Direction a change = reset le peak
+        if signal.direction != self.peak_direction:
+            self.peak_score = signal.score
+            self.peak_direction = signal.direction
+            self.peak_signal = signal
+            self.declining_count = 0
+            return False, signal, f"Nouveau signal {signal.direction}, score={signal.score}, attente du pic"
+
+        # Score monte = nouveau pic
+        if signal.score >= self.peak_score:
+            self.peak_score = signal.score
+            self.peak_signal = signal
+            self.declining_count = 0
+            return False, signal, f"Score monte: {signal.score} (pic={self.peak_score}), attente"
+
+        # Score baisse = le pic est peut-etre passe
+        self.declining_count += 1
+
+        # Score tres haut (>= 90) = entrer vite, pas le temps d'attendre
+        if self.peak_score >= 90:
+            return True, self.peak_signal, f"Score pic {self.peak_score} >= 90, entree immediate"
+
+        # Score a baisse pendant PATIENCE iterations = pic confirme, entrer
+        if self.declining_count >= self.SCORE_PEAK_PATIENCE:
+            best_signal = self.peak_signal
+            msg = f"PIC DETECTE: {self.peak_score} -> {signal.score} (baisse x{self.declining_count})"
+            # Reset pour le prochain trade
+            self.peak_score = 0
+            self.peak_direction = ""
+            self.peak_signal = None
+            self.declining_count = 0
+            return True, best_signal, msg
+
+        return False, signal, f"Score baisse: {signal.score} (pic={self.peak_score}, attente {self.declining_count}/{self.SCORE_PEAK_PATIENCE})"
 
     def cooldown_remaining(self) -> int:
         """Secondes restantes de cooldown"""
@@ -1839,32 +1900,30 @@ def main():
                     _, spread = check_spread()
                     print(f"\n  SPREAD TROP LARGE: {spread:.0f}$ > max {MAX_SPREAD_USD}$")
 
-                # Check 3: Score adaptatif (plus strict apres pertes)
-                elif signal.score < risk_mgr.get_adjusted_score_min():
-                    adj_min = risk_mgr.get_adjusted_score_min()
-                    print(f"\n  SCORE INSUFFISANT apres pertes: {signal.score}/{adj_min} "
-                          f"(+{adj_min - SCORE_MIN_ENTRY} cause {risk_mgr.consecutive_losses} pertes)")
-
-                # Check 4: Confirmation (apres pertes, attendre 2 signaux identiques)
+                # Check 3: Confirmation (apres pertes)
                 elif risk_mgr.needs_confirmation(signal):
                     print(f"\n  CONFIRMATION: signal {signal.direction} vu "
                           f"{risk_mgr.signal_confirm_count}/2 fois (apres pertes)")
 
-                # Check 5: Entree validee
+                # Check 4: Attendre le meilleur score (peak detection)
                 else:
-                    lot = risk_mgr.compute_lot(signal, snap.atr, snap.prix)
-                    success = executor.open_order(signal.direction, lot)
-                    if success:
-                        risk_mgr.on_new_trade(signal)
-                        risk_mgr.signal_confirm_count = 0
-                        print(f"\n  >>> TRADE OUVERT: {signal.direction} | Lot={lot} | Score={signal.score}")
-                        logger.info(
-                            f"OUVERTURE {signal.direction} | Score={signal.score} | "
-                            f"Scenarios={signal.scenario_count} | Lot={lot} | "
-                            f"Raisons: {'; '.join(signal.reasons[:5])}"
-                        )
-                    else:
-                        print(f"\n  !!! ECHEC OUVERTURE {signal.direction} (verifier MT5)")
+                    enter_now, best_signal, peak_msg = risk_mgr.should_enter_now(signal)
+                    print(f"\n  PEAK: {peak_msg}")
+
+                    if enter_now:
+                        lot = risk_mgr.compute_lot(best_signal, snap.atr, snap.prix)
+                        success = executor.open_order(best_signal.direction, lot)
+                        if success:
+                            risk_mgr.on_new_trade(best_signal)
+                            risk_mgr.signal_confirm_count = 0
+                            print(f"  >>> TRADE OUVERT: {best_signal.direction} | Lot={lot} | Score={best_signal.score}")
+                            logger.info(
+                                f"OUVERTURE {best_signal.direction} | Score={best_signal.score} | "
+                                f"Scenarios={best_signal.scenario_count} | Lot={lot} | "
+                                f"Raisons: {'; '.join(best_signal.reasons[:5])}"
+                            )
+                        else:
+                            print(f"\n  !!! ECHEC OUVERTURE {best_signal.direction} (verifier MT5)")
             else:
                 # Afficher info
                 adj_min = risk_mgr.get_adjusted_score_min()
