@@ -38,7 +38,7 @@ MAX_POSITIONS = 1       # 1 seul trade a la fois
 SOLDE = 27              # Solde du compte en $
 STOP_LOSS_MAX = 8       # Perte max en $ (protection solde)
 COOLDOWN_SECONDS = 60   # Attente apres fermeture avant re-entrer
-MAX_SPREAD_USD = 50     # Spread max acceptable en $ (sinon pas de trade)
+MAX_SPREAD_USD = 60     # Spread max acceptable (XM = ~50$, marge de securite)
 MIN_SCORE_DIFF = 15     # Difference min entre BUY et SELL score
 TRADE_HISTORY_FILE = os.path.join(SCRIPT_DIR, "trades_history.csv")
 MAX_CONSECUTIVE_LOSSES = 3   # Apres 3 pertes d'affilee, augmenter le seuil
@@ -1392,6 +1392,11 @@ class Dashboard:
         print("      Lot: 0.05 | Solde: 27$ | 1 trade max")
         print("=" * 58)
         print(f"  Heure   : {datetime.now().strftime('%H:%M:%S')}")
+        # Afficher spread en temps reel
+        tick = mt5.symbol_info_tick(SYMBOL)
+        spread_val = abs(tick.ask - tick.bid) if tick else 0
+        spread_ok = "OK" if spread_val <= MAX_SPREAD_USD else "HAUT!"
+        print(f"  Spread  : {spread_val:.1f}$ ({spread_ok})")
         print("-" * 58)
         print(f"  Prix    : {snap.prix:>10.2f} $")
         print(f"  RSI(7)  : {snap.rsi_7:>6.1f}  | RSI(14): {snap.rsi_14:>6.1f}")
@@ -1616,11 +1621,14 @@ def main():
                     if success:
                         risk_mgr.on_new_trade(signal)
                         risk_mgr.signal_confirm_count = 0
+                        print(f"\n  >>> TRADE OUVERT: {signal.direction} | Lot={lot} | Score={signal.score}")
                         logger.info(
                             f"OUVERTURE {signal.direction} | Score={signal.score} | "
                             f"Scenarios={signal.scenario_count} | Lot={lot} | "
                             f"Raisons: {'; '.join(signal.reasons[:5])}"
                         )
+                    else:
+                        print(f"\n  !!! ECHEC OUVERTURE {signal.direction} (verifier MT5)")
             else:
                 # Afficher info
                 adj_min = risk_mgr.get_adjusted_score_min()
