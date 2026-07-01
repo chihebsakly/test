@@ -1294,7 +1294,17 @@ class RiskManager:
             if self.first_trade_dir == "BUY" and snap.rsi_7 <= 30:
                 return True, f"RSI REBOND BUY: RSI={snap.rsi_7:.0f}<=30 chute continue {total_profit:.2f}$"
 
-        # RSI securise le profit
+        # TP MINIMUM 4$ si solde < 200$ (securiser le gain)
+        if total_profit >= 4:
+            account = mt5.account_info()
+            if account and account.balance < 200:
+                # RSI doit aussi confirmer (au moins RSI > 40 pour BUY ou < 60 pour SELL)
+                if self.first_trade_dir == "BUY" and snap.rsi_7 >= 40:
+                    return True, f"TP MIN 4$: +{total_profit:.2f}$ (solde {account.balance:.0f}$<200)"
+                if self.first_trade_dir == "SELL" and snap.rsi_7 <= 60:
+                    return True, f"TP MIN 4$: +{total_profit:.2f}$ (solde {account.balance:.0f}$<200)"
+
+        # RSI securise le profit (laisser courir au-dela de 4$ si RSI pas encore retourne)
         if total_profit > 0:
             if self.first_trade_dir == "BUY" and snap.rsi_7 >= 60:
                 return True, f"RSI securise BUY: RSI={snap.rsi_7:.0f}, profit +{total_profit:.2f}$"
