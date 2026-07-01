@@ -2,7 +2,7 @@
 """
 BOT EXPERT TRADING BTC/USD - VERSION ULTIME
 40+ Scenarios d'opportunite - Architecture Modulaire
-Lot fixe 0.05 - Solde 27$ - 1 seul trade
+Lot fixe 0.05 - 1 seul trade
 """
 
 import MetaTrader5 as mt5
@@ -35,8 +35,7 @@ LOG_FILE = os.path.join(SCRIPT_DIR, "bot_expert.log")
 SCORE_MIN_ENTRY = 55    # Seuil minimum pour entrer
 SCORE_AGGRESSIVE = 80   # Seuil mode agressif
 MAX_POSITIONS = 1       # 1 seul trade a la fois
-SOLDE = 27              # Solde du compte en $
-STOP_LOSS_MAX = 8       # Perte max en $ (protection solde)
+STOP_LOSS_MAX = 7       # Perte max en $ (protection solde reel ~23$)
 COOLDOWN_SECONDS = 60   # Attente apres fermeture avant re-entrer
 MAX_SPREAD_USD = 60     # Spread max acceptable (XM = ~50$, marge de securite)
 MIN_SCORE_DIFF = 15     # Difference min entre BUY et SELL score
@@ -1320,35 +1319,143 @@ class RiskManager:
 # ==============================================================
 # ORDER EXECUTOR
 # ==============================================================
+
+# Codes d'erreur MT5 courants
+MT5_ERROR_CODES = {
+    10004: "Requote (prix change)",
+    10006: "Requete rejetee",
+    10007: "Requete annulee par le trader",
+    10010: "Ordre non supporte",
+    10011: "Pas assez d'argent (marge insuffisante)",
+    10013: "Trade desactive",
+    10014: "Volume invalide",
+    10015: "Prix invalide",
+    10016: "Stops invalides",
+    10017: "Trade desactive pour ce symbole",
+    10018: "Marche ferme",
+    10019: "Pas assez de marge",
+    10020: "Requete modifiee mais resultat inconnu",
+    10021: "Trop de requetes",
+    10024: "Pas de changements",
+    10026: "Autotrading desactive sur MT5",
+    10027: "Autotrading desactive cote serveur",
+    10030: "Type de filling invalide",
+}
+
+
+def get_filling_type():
+    """Detecte le type de filling supporte par le symbole sur ce serveur"""
+    info = mt5.symbol_info(SYMBOL)
+    if info is None:
+        return mt5.ORDER_FILLING_IOC
+
+    filling = info.filling_mode
+    if filling & 1:  # FOK supporte
+        return mt5.ORDER_FILLING_FOK
+    elif filling & 2:  # IOC supporte
+        return mt5.ORDER_FILLING_IOC
+    else:
+        return mt5.ORDER_FILLING_RETURN
+
+
 class OrderExecutor:
+    def __init__(self):
+        self.filling_type = None  # None = ne pas envoyer (comme le script initial)
+        # Tester si filling est necessaire
+        info = mt5.symbol_info(SYMBOL)
+        if info:
+            logger.info(f"Symbol filling_mode: {info.filling_mode}")
+
+    def _build_request(self, order_type, volume, price, position_ticket=None):
+        """Construit la requete EXACTEMENT comme le script initial"""
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": SYMBOL,
+            "volume": volume,
+            "type": order_type,
+            "price": price,
+            "deviation": 20,
+            "magic": MAGIC_NUMBER
+        }
+        if position_ticket is not None:
+            request["position"] = position_ticket
+        return request
+
+    def _try_send(self, request, label):
+        """Envoie l'ordre. Si echec, retente avec type_filling"""
+        # Tentative 1 : comme le script initial (sans filling)
+        result = mt5.order_send(request)
+
+        if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+            return result
+
+        # Tentative 2 : avec type_filling IOC
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            code = result.retcode if result else 0
+            logger.warning(f"{label} tentative 1 echouee (code={code}), retry avec IOC")
+            request["type_filling"] = mt5.ORDER_FILLING_IOC
+            result = mt5.order_send(request)
+
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                self.filling_type = mt5.ORDER_FILLING_IOC
+                return result
+
+        # Tentative 3 : avec type_filling FOK
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            code = result.retcode if result else 0
+            logger.warning(f"{label} tentative 2 echouee (code={code}), retry avec FOK")
+            request["type_filling"] = mt5.ORDER_FILLING_FOK
+            result = mt5.order_send(request)
+
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                self.filling_type = mt5.ORDER_FILLING_FOK
+                return result
+
+        return result  # retourne le dernier resultat (echec)
+
     def open_order(self, direction: str, lot: float) -> bool:
         tick = mt5.symbol_info_tick(SYMBOL)
         if tick is None:
             logger.error("Tick indisponible")
+            print("  !!! Tick indisponible")
             return False
 
         order_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
         price = tick.ask if direction == "BUY" else tick.bid
 
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": SYMBOL,
-            "volume": lot,
-            "type": order_type,
-            "price": price,
-            "deviation": 20,
-            "magic": MAGIC_NUMBER,
-            "comment": "BotExpert_v2"
-        }
+        request = self._build_request(order_type, lot, price)
 
-        result = mt5.order_send(request)
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            logger.info(f"OUVERT {direction} | Lot={lot} | Prix={price:.2f}")
-            return True
+        # Si on a deja trouve un filling qui marche, l'utiliser directement
+        if self.filling_type is not None:
+            request["type_filling"] = self.filling_type
+            result = mt5.order_send(request)
         else:
-            code = result.retcode if result else "None"
-            logger.error(f"ECHEC {direction} | Code={code}")
-            return False
+            result = self._try_send(request, f"OPEN {direction}")
+
+        if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+            logger.info(f"OUVERT {direction} | Lot={lot} | Prix={price:.2f} | Ticket={result.order}")
+            return True
+
+        # Echec final
+        if result is None:
+            err = mt5.last_error()
+            logger.error(f"ECHEC {direction} | order_send=None | last_error={err}")
+            print(f"  !!! ECHEC: order_send=None (erreur MT5: {err})")
+        else:
+            code = result.retcode
+            desc = MT5_ERROR_CODES.get(code, "Erreur inconnue")
+            comment = result.comment if result.comment else ""
+            logger.error(f"ECHEC {direction} | Code={code} ({desc}) | {comment}")
+            print(f"  !!! ECHEC {direction}: [{code}] {desc}")
+            if comment:
+                print(f"      MT5 dit: {comment}")
+            if code == 10011:
+                print(f"      -> Solde insuffisant pour ouvrir {lot} lot")
+            elif code == 10026:
+                print(f"      -> Activez AutoTrading dans MT5 (bouton en haut)")
+            elif code == 10018:
+                print(f"      -> Le marche est ferme (weekend?)")
+        return False
 
     def close_position(self, pos, reason: str) -> bool:
         tick = mt5.symbol_info_tick(SYMBOL)
@@ -1358,24 +1465,23 @@ class OrderExecutor:
         order_type = mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY
         price = tick.bid if pos.type == 0 else tick.ask
 
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": SYMBOL,
-            "volume": pos.volume,
-            "type": order_type,
-            "position": pos.ticket,
-            "price": price,
-            "deviation": 20,
-            "magic": MAGIC_NUMBER,
-            "comment": "Close_v2"
-        }
+        request = self._build_request(order_type, pos.volume, price, pos.ticket)
 
-        result = mt5.order_send(request)
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+        # Si on a deja trouve un filling qui marche, l'utiliser
+        if self.filling_type is not None:
+            request["type_filling"] = self.filling_type
+            result = mt5.order_send(request)
+        else:
+            result = self._try_send(request, "CLOSE")
+
+        if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
             logger.info(f"FERME | Raison: {reason} | Profit: {pos.profit:.2f}$")
             return True
         else:
-            logger.error(f"Echec fermeture | Raison: {reason}")
+            code = result.retcode if result else 0
+            desc = MT5_ERROR_CODES.get(code, "Erreur inconnue")
+            logger.error(f"ECHEC fermeture | Code={code} ({desc}) | {reason}")
+            print(f"  !!! ECHEC fermeture: [{code}] {desc}")
             return False
 
 
@@ -1389,7 +1495,7 @@ class Dashboard:
 
         print("=" * 58)
         print("      BOT EXPERT TRADING BTC - 64 SCENARIOS")
-        print("      Lot: 0.05 | Solde: 27$ | 1 trade max")
+        print("      Lot: 0.05 | 1 trade max")
         print("=" * 58)
         print(f"  Heure   : {datetime.now().strftime('%H:%M:%S')}")
         # Afficher spread en temps reel
@@ -1484,11 +1590,25 @@ class Dashboard:
             balance = account.balance
             margin = account.margin
             free_margin = account.margin_free
-            pl_total = equity - balance
-            print(f"  Solde   : {balance:.2f}$ | Equity: {equity:.2f}$")
-            print(f"  Marge   : {margin:.2f}$ | Libre: {free_margin:.2f}$")
-            if pl_total != 0:
-                print(f"  P/L ouvert: {pl_total:+.2f}$")
+            profit_total = account.profit
+            credit = account.credit
+            vrai_solde = balance  # sans le credit
+
+            print(f"  Balance : {balance:.2f}$ | Equity: {equity:.2f}$")
+            if credit > 0:
+                print(f"  Credit  : {credit:.2f}$ (bonus XM, non retirable)")
+                print(f"  Vrai $  : {balance:.2f}$ (sans bonus)")
+
+            if positions:
+                print(f"  Marge   : {margin:.2f}$ | Libre: {free_margin:.2f}$")
+                print(f"  P/L     : {profit_total:+.2f}$")
+                if margin > 0:
+                    margin_level = equity / margin * 100
+                    print(f"  Niveau  : {margin_level:.0f}%")
+            else:
+                pl_calc = equity - balance
+                if abs(pl_calc) > 0.01 and credit == 0:
+                    print(f"  Diff    : {pl_calc:+.2f}$ (swap/commission)")
 
         print("=" * 58)
 
@@ -1621,6 +1741,9 @@ def main():
     executor = OrderExecutor()
     dashboard = Dashboard()
     validator = DataValidator()
+
+    filling_names = {0: "FOK", 1: "IOC", 2: "RETURN", None: "AUTO (comme script initial)"}
+    print(f"  Filling : {filling_names.get(executor.filling_type, executor.filling_type)}")
 
     # Check initial du fichier historique
     hist_ok, hist_msg = validator.validate_trade_history()
