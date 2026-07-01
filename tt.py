@@ -1348,35 +1348,12 @@ def get_filling_type():
 
 class OrderExecutor:
     def __init__(self):
-        # Detecter le filling supporte par le broker AU DEMARRAGE
-        self.filling_type = self._detect_filling()
-        filling_names = {
-            mt5.ORDER_FILLING_FOK: "FOK",
-            mt5.ORDER_FILLING_IOC: "IOC",
-            mt5.ORDER_FILLING_RETURN: "RETURN"
-        }
-        logger.info(f"Filling detecte: {filling_names.get(self.filling_type, self.filling_type)}")
-        print(f"  Filling : {filling_names.get(self.filling_type, '?')}")
-
-    def _detect_filling(self):
-        """Detecte le type de filling supporte par le symbole sur ce serveur"""
-        info = mt5.symbol_info(SYMBOL)
-        if info is None:
-            return mt5.ORDER_FILLING_IOC
-
-        filling = info.filling_mode
-        logger.info(f"Symbol filling_mode brut: {filling}")
-
-        # Tester chaque mode
-        if filling & 2:  # IOC supporte (le plus courant sur XM)
-            return mt5.ORDER_FILLING_IOC
-        elif filling & 1:  # FOK supporte
-            return mt5.ORDER_FILLING_FOK
-        else:
-            return mt5.ORDER_FILLING_RETURN
+        self.filling_type = None  # None = ne pas envoyer (comme le script initial qui marchait)
+        logger.info("OrderExecutor: mode initial SANS type_filling")
+        print(f"  Filling : AUTO (sans filling d'abord, comme script initial)")
 
     def _build_request(self, order_type, volume, price, position_ticket=None):
-        """Construit la requete avec SL reel visible sur MT5"""
+        """Construit la requete comme le script initial (SANS type_filling)"""
         # Calculer le SL
         point = mt5.symbol_info(SYMBOL).point if mt5.symbol_info(SYMBOL) else 1.0
         if order_type == mt5.ORDER_TYPE_BUY:
@@ -1391,13 +1368,53 @@ class OrderExecutor:
             "type": order_type,
             "price": price,
             "sl": sl,
-            "type_filling": self.filling_type,
             "deviation": 20,
             "magic": MAGIC_NUMBER
         }
+        # Ajouter filling SEULEMENT si on a trouve un qui marche
+        if self.filling_type is not None:
+            request["type_filling"] = self.filling_type
         if position_ticket is not None:
             request["position"] = position_ticket
         return request
+
+    def _send_with_retry(self, request, label) -> object:
+        """Envoie sans filling d'abord, puis retente avec si echec"""
+        # Tentative 1 : SANS type_filling (comme le script initial)
+        req1 = dict(request)
+        req1.pop("type_filling", None)
+        result = mt5.order_send(req1)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            return result
+
+        # Tentative 2 : avec RETURN
+        code = result.retcode if result else 0
+        logger.warning(f"{label} sans filling echoue (code={code}), essai RETURN")
+        request["type_filling"] = mt5.ORDER_FILLING_RETURN
+        result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            self.filling_type = mt5.ORDER_FILLING_RETURN
+            return result
+
+        # Tentative 3 : avec IOC
+        code = result.retcode if result else 0
+        logger.warning(f"{label} RETURN echoue (code={code}), essai IOC")
+        request["type_filling"] = mt5.ORDER_FILLING_IOC
+        result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            self.filling_type = mt5.ORDER_FILLING_IOC
+            return result
+
+        # Tentative 4 : avec FOK
+        code = result.retcode if result else 0
+        logger.warning(f"{label} IOC echoue (code={code}), essai FOK")
+        request["type_filling"] = mt5.ORDER_FILLING_FOK
+        result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            self.filling_type = mt5.ORDER_FILLING_FOK
+            return result
+
+        return result
 
     def open_order(self, direction: str, lot: float) -> bool:
         tick = mt5.symbol_info_tick(SYMBOL)
@@ -1410,7 +1427,12 @@ class OrderExecutor:
         price = tick.ask if direction == "BUY" else tick.bid
 
         request = self._build_request(order_type, lot, price)
-        result = mt5.order_send(request)
+
+        # Si on a deja trouve un filling qui marche, envoyer direct
+        if self.filling_type is not None:
+            result = mt5.order_send(request)
+        else:
+            result = self._send_with_retry(request, f"OPEN {direction}")
 
         if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
             logger.info(f"OUVERT {direction} | Lot={lot} | Prix={price:.2f} | Ticket={result.order}")
@@ -1435,17 +1457,6 @@ class OrderExecutor:
                 print(f"      -> Activez AutoTrading dans MT5 (bouton en haut)")
             elif code == 10018:
                 print(f"      -> Le marche est ferme (weekend?)")
-            elif code == 10030:
-                print(f"      -> Filling invalide, test autres modes...")
-                # Tenter l'autre filling en secours
-                alt = mt5.ORDER_FILLING_FOK if self.filling_type == mt5.ORDER_FILLING_IOC else mt5.ORDER_FILLING_IOC
-                request["type_filling"] = alt
-                result2 = mt5.order_send(request)
-                if result2 and result2.retcode == mt5.TRADE_RETCODE_DONE:
-                    self.filling_type = alt
-                    logger.info(f"OUVERT avec filling alternatif: {alt}")
-                    print(f"      -> Reussi avec filling alternatif!")
-                    return True
         return False
 
     def close_position(self, pos, reason: str) -> bool:
@@ -1457,7 +1468,11 @@ class OrderExecutor:
         price = tick.bid if pos.type == 0 else tick.ask
 
         request = self._build_request(order_type, pos.volume, price, pos.ticket)
-        result = mt5.order_send(request)
+
+        if self.filling_type is not None:
+            result = mt5.order_send(request)
+        else:
+            result = self._send_with_retry(request, "CLOSE")
 
         if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
             logger.info(f"FERME | Raison: {reason} | Profit: {pos.profit:.2f}$")
@@ -1467,15 +1482,6 @@ class OrderExecutor:
             desc = MT5_ERROR_CODES.get(code, "Erreur inconnue")
             logger.error(f"ECHEC fermeture | Code={code} ({desc}) | {reason}")
             print(f"  !!! ECHEC fermeture: [{code}] {desc}")
-            # Tenter avec l'autre filling
-            if code == 10030:
-                alt = mt5.ORDER_FILLING_FOK if self.filling_type == mt5.ORDER_FILLING_IOC else mt5.ORDER_FILLING_IOC
-                request["type_filling"] = alt
-                result2 = mt5.order_send(request)
-                if result2 and result2.retcode == mt5.TRADE_RETCODE_DONE:
-                    self.filling_type = alt
-                    logger.info(f"FERME avec filling alternatif | {reason}")
-                    return True
             return False
 
 
