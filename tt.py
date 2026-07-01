@@ -7,7 +7,6 @@ Lot fixe 0.05 - 1 seul trade
 
 import MetaTrader5 as mt5
 import pandas as pd
-import numpy as np
 import time
 import os
 import logging
@@ -15,7 +14,7 @@ from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volatility import AverageTrueRange, BollingerBands
 from ta.trend import MACD, EMAIndicator
 from ta.volume import OnBalanceVolumeIndicator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from datetime import datetime
 
@@ -32,11 +31,11 @@ TIMEFRAME = mt5.TIMEFRAME_M5
 HIST_BOUGIES = 2016     # 7 jours
 LOOP_INTERVAL = 2       # secondes
 LOG_FILE = os.path.join(SCRIPT_DIR, "bot_expert.log")
-SCORE_MIN_ENTRY = 120   # Score minimum 1er trade (tres haut = tres sur)
-SCORE_DCA_BONUS = 20    # 2eme trade si score >= score_1er + ce bonus
-SCORE_AGGRESSIVE = 140  # Seuil mode agressif (combo extreme)
+SCORE_MIN_ENTRY = 150   # Score minimum 1er trade (150/100 = tres selectif)
+SCORE_DCA_MIN = 200     # Score minimum 2eme trade (DCA = tres sur)
+SCORE_AGGRESSIVE = 180  # Seuil mode agressif (combo extreme)
 WARMUP_LOOPS = 15       # Attendre 15 boucles (~30s) observer le marche avant de trader
-MAX_POSITIONS = 2       # Max 2 trades (DCA)
+MAX_POSITIONS = 2       # 1 seul trade normal + 1 DCA urgence seulement (score 200+)
 STOP_LOSS_MAX = 15      # Perte max en $ PAR TRADE (stop fixe -15$)
 STOP_LOSS_TOTAL = 20    # Perte max TOTALE pour les 2 trades combines
 COOLDOWN_SECONDS = 60   # Attente apres fermeture avant re-entrer
@@ -46,15 +45,14 @@ TRADE_HISTORY_FILE = os.path.join(SCRIPT_DIR, "trades_history.csv")
 MAX_CONSECUTIVE_LOSSES = 3   # Apres 3 pertes d'affilee, augmenter le seuil
 DAILY_LOSS_LIMIT = 12        # Arret si perte totale session >= 12$
 DAILY_PROFIT_TARGET = 20     # Objectif journalier (info seulement)
-FIXED_TP_AMOUNT = 4          # TP fixe en $ tant que solde < seuil
-FIXED_TP_BALANCE_LIMIT = 200 # Au-dessus de ce solde, TP dynamique reprend
 # RSI seuils d'entree (plus precis que le score seul)
 RSI_BUY_1 = 18              # 1er trade BUY si RSI7 <= cette valeur
 RSI_BUY_DCA = 12            # DCA BUY si RSI7 <= cette valeur
 RSI_SELL_1 = 79             # 1er trade SELL si RSI7 >= cette valeur
 RSI_SELL_DCA = 87           # DCA SELL si RSI7 >= cette valeur
+RSI_NEUTRAL_LOW = 40        # RSI zone neutre basse (apres SL, attendre que RSI passe ici)
+RSI_NEUTRAL_HIGH = 60       # RSI zone neutre haute
 # Stop Loss reel en points (envoye a MT5, visible sur le graphique)
-# Pour BTCUSD 0.05 lot : 1 point = ~0.05$, donc 15$ / 0.05 = 300 points
 SL_POINTS = 300             # Stop Loss en points (= ~15$ pour 0.05 lot)
 TIMEFRAME_CONFIRM = mt5.TIMEFRAME_M15  # Timeframe de confirmation
 TIMEFRAME_FOND = mt5.TIMEFRAME_M30     # Timeframe de fond (tendance generale)
@@ -1106,56 +1104,62 @@ class SignalGenerator:
 
 
 # ==============================================================
-# RISK MANAGER - TP a 3 niveaux (1-5$ / 10-15$ / 25-30$)
+# RISK MANAGER - DCA + Post-SL RSI Reset
 # ==============================================================
 class RiskManager:
 
     def __init__(self):
         self.entry_score = 0
         self.max_profit_seen = 0
-        self.last_close_time = 0    # Timestamp derniere fermeture
-        self.total_profit = 0       # Profit cumule session
-        self.trade_count = 0        # Nombre de trades
-        self.win_count = 0          # Trades gagnants
-        self.consecutive_losses = 0 # Pertes consecutives
-        self.session_stopped = False # Session arretee (limite pertes)
-        self.last_signal_dir = ""   # Derniere direction signalee
-        self.signal_confirm_count = 0  # Compteur confirmation
+        self.last_close_time = 0
+        self.total_profit = 0
+        self.trade_count = 0
+        self.win_count = 0
+        self.consecutive_losses = 0
+        self.session_stopped = False
+        self.last_signal_dir = ""
+        self.signal_confirm_count = 0
         # DCA
-        self.first_trade_score = 0  # Score du 1er trade
-        self.first_trade_dir = ""   # Direction du 1er trade
-        self.dca_active = False     # 2eme trade ouvert (mode DCA)
+        self.first_trade_score = 0
+        self.first_trade_dir = ""
+        self.dca_active = False
+        # Post-SL : attendre que RSI revienne en zone neutre
+        self.waiting_rsi_reset = False
+        self.rsi_was_neutral = False
 
     def on_new_trade(self, signal: Signal, is_dca=False):
         """Appele quand un nouveau trade est ouvert"""
         self.entry_score = signal.score
         self.max_profit_seen = 0
+        self.waiting_rsi_reset = False
+        self.rsi_was_neutral = False
         if not is_dca:
-            # Premier trade
             self.first_trade_score = signal.score
             self.first_trade_dir = signal.direction
             self.dca_active = False
         else:
-            # Deuxieme trade (renforcement)
             self.dca_active = True
 
-    def on_trade_closed(self, profit: float):
-        """Appele quand un trade est ferme - historique"""
+    def on_trade_closed(self, profit: float, was_stop=False):
+        """Appele quand un trade est ferme"""
         self.last_close_time = time.time()
         self.total_profit += profit
         self.trade_count += 1
         if profit > 0:
             self.win_count += 1
             self.consecutive_losses = 0
+            self.waiting_rsi_reset = False
         else:
             self.consecutive_losses += 1
+            if was_stop:
+                self.waiting_rsi_reset = True
+                self.rsi_was_neutral = False
+                logger.info("POST-SL: attente RSI zone neutre avant prochain trade")
 
-        # Verifier limite perte session
         if self.total_profit <= -DAILY_LOSS_LIMIT:
             self.session_stopped = True
-            logger.warning(f"SESSION ARRETEE: perte totale {self.total_profit:.2f}$ >= limite {DAILY_LOSS_LIMIT}$")
+            logger.warning(f"SESSION ARRETEE: perte totale {self.total_profit:.2f}$")
 
-        # Sauvegarder dans CSV
         try:
             header_needed = not os.path.exists(TRADE_HISTORY_FILE) or os.path.getsize(TRADE_HISTORY_FILE) == 0
             row = f"{datetime.now()},{profit:.2f},{self.total_profit:.2f},{self.trade_count},{self.win_count}\n"
@@ -1166,141 +1170,138 @@ class RiskManager:
         except:
             pass
 
+    def update_rsi_reset(self, rsi: float):
+        """Apres un SL, verifie si RSI est revenu en zone neutre (40-60)"""
+        if not self.waiting_rsi_reset:
+            return
+        if RSI_NEUTRAL_LOW <= rsi <= RSI_NEUTRAL_HIGH:
+            self.rsi_was_neutral = True
+            logger.info(f"POST-SL: RSI={rsi:.1f} zone neutre, nouveau cycle autorise")
+
+    def is_rsi_reset_blocking(self) -> Tuple[bool, str]:
+        """True si on attend encore le RSI reset apres un SL"""
+        if not self.waiting_rsi_reset:
+            return False, ""
+        if self.rsi_was_neutral:
+            self.waiting_rsi_reset = False
+            return False, ""
+        return True, "POST-SL: attente RSI zone neutre (40-60) = correction en cours"
+
     def get_adjusted_score_min(self) -> int:
-        """Score minimum adaptatif : plus strict apres des pertes"""
+        """Score minimum adaptatif"""
         if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            # Apres 3 pertes, on augmente le seuil de 15 points
-            return SCORE_MIN_ENTRY + 15
+            return SCORE_MIN_ENTRY + 30
         elif self.consecutive_losses >= 2:
-            # Apres 2 pertes, +10 points
-            return SCORE_MIN_ENTRY + 10
+            return SCORE_MIN_ENTRY + 20
         return SCORE_MIN_ENTRY
 
     def needs_confirmation(self, signal: Signal) -> bool:
-        """
-        Apres des pertes, exiger que le signal soit present 2 fois d'affilee
-        pour confirmer avant d'entrer
-        """
+        """Apres pertes, exiger 2 lectures consecutives"""
         if self.consecutive_losses < 2:
-            # Pas de confirmation requise si on gagne
             self.last_signal_dir = signal.direction
             return False
-
-        # Apres 2+ pertes : exiger confirmation
         if signal.direction == self.last_signal_dir:
             self.signal_confirm_count += 1
         else:
             self.signal_confirm_count = 0
             self.last_signal_dir = signal.direction
-
-        # Il faut 2 lectures consecutives dans la meme direction
         return self.signal_confirm_count < 2
 
     def is_cooldown_active(self) -> bool:
-        """Verifie si on est en periode de cooldown"""
         if self.last_close_time == 0:
             return False
-        elapsed = time.time() - self.last_close_time
-        return elapsed < COOLDOWN_SECONDS
+        return (time.time() - self.last_close_time) < COOLDOWN_SECONDS
 
     def can_enter(self, signal: Signal, snap) -> Tuple[bool, str]:
-        """
-        Entree UNIQUEMENT si:
-        - Score >= seuil adaptatif
-        - RSI dans la zone extreme (BUY <= 18, SELL >= 79)
-        """
+        """1er trade : Score >= 150 + RSI extreme + tendance pas contre nous"""
         score_min = self.get_adjusted_score_min()
         if signal.direction == "NONE" or signal.score < score_min:
             return False, f"Score {signal.score} < seuil {score_min}"
-
-        # Verifier RSI extreme
         if signal.direction == "BUY" and snap.rsi_7 > RSI_BUY_1:
-            return False, f"RSI {snap.rsi_7:.1f} > {RSI_BUY_1} (pas assez bas pour BUY)"
+            return False, f"RSI {snap.rsi_7:.1f} > {RSI_BUY_1} (pas assez bas)"
         if signal.direction == "SELL" and snap.rsi_7 < RSI_SELL_1:
-            return False, f"RSI {snap.rsi_7:.1f} < {RSI_SELL_1} (pas assez haut pour SELL)"
+            return False, f"RSI {snap.rsi_7:.1f} < {RSI_SELL_1} (pas assez haut)"
+
+        # FILTRE TENDANCE : ne pas SELL dans une forte tendance haussiere
+        if signal.direction == "SELL" and snap.trend_m15 == "UP" and snap.trend_m30 == "UP":
+            return False, f"BLOQUE SELL: M15+M30 haussiers (tendance forte contre SELL)"
+        if signal.direction == "BUY" and snap.trend_m15 == "DOWN" and snap.trend_m30 == "DOWN":
+            return False, f"BLOQUE BUY: M15+M30 baissiers (tendance forte contre BUY)"
 
         return True, f"Score {signal.score} + RSI {snap.rsi_7:.1f} EXTREME, ENTREE!"
 
-    def cooldown_remaining(self) -> int:
-        """Secondes restantes de cooldown"""
-        if self.last_close_time == 0:
-            return 0
-        elapsed = time.time() - self.last_close_time
-        remaining = COOLDOWN_SECONDS - elapsed
-        return max(0, int(remaining))
-
-    def compute_lot(self, signal: Signal, atr: float, prix: float) -> float:
-        """Lot fixe 0.05"""
-        return LOT
-
-    def should_close_all(self, positions, snap: MarketSnapshot) -> Tuple[bool, str]:
-        """
-        Gestion DCA : verifie le profit TOTAL de toutes les positions.
-        - Si perte totale >= stop : ferme tout
-        - Si RSI change de sens avec profit > 0 : ferme tout (laisser courir)
-        - Break-even si retombe a 0 apres avoir vu du profit
-        """
-        total_profit = sum(p.profit for p in positions)
-        nb_pos = len(positions)
-
-        # Mise a jour profit max (total)
-        if total_profit > self.max_profit_seen:
-            self.max_profit_seen = total_profit
-
-        # === STOP LOSS TOTAL ===
-        if nb_pos >= 2 and total_profit <= -STOP_LOSS_TOTAL:
-            return True, f"STOP TOTAL DCA: {total_profit:.2f}$ (max -{STOP_LOSS_TOTAL}$)"
-        if nb_pos == 1 and total_profit <= -STOP_LOSS_MAX:
-            return True, f"STOP: {total_profit:.2f}$ (max -{STOP_LOSS_MAX}$)"
-
-        # === BREAK-EVEN : vu +2$ total, retombe a 0 ===
-        if self.max_profit_seen >= 2 and total_profit <= 0:
-            return True, f"Break-even: max vu +{self.max_profit_seen:.2f}$, retombe a {total_profit:.2f}$"
-
-        # === RSI change de sens = le mouvement est fini, securiser le profit ===
-        if total_profit > 0:
-            if self.first_trade_dir == "BUY" and snap.rsi_7 >= 60:
-                return True, f"RSI securise BUY: RSI={snap.rsi_7:.0f}>=60, profit +{total_profit:.2f}$"
-            if self.first_trade_dir == "SELL" and snap.rsi_7 <= 40:
-                return True, f"RSI securise SELL: RSI={snap.rsi_7:.0f}<=40, profit +{total_profit:.2f}$"
-
-        return False, ""
-
     def can_open_dca(self, signal: Signal, positions, snap) -> Tuple[bool, str]:
-        """
-        Verifie si on peut ouvrir le 2eme trade (DCA).
-        Conditions:
-        - 1 position deja ouverte, en perte
-        - Meme direction que le 1er trade
-        - Score actuel >= score du 1er + SCORE_DCA_BONUS
-        - RSI encore plus extreme (BUY <= 12, SELL >= 87)
-        """
+        """2eme trade : Score >= 200 + RSI ultra-extreme"""
         if len(positions) != 1:
             return False, ""
         if self.dca_active:
             return False, "DCA deja actif"
-
         pos = positions[0]
-        # Le 1er trade doit etre en perte
         if pos.profit >= 0:
-            return False, "Position en profit, pas besoin de DCA"
-
-        # Meme direction
+            return False, "En profit, pas besoin DCA"
         if signal.direction != self.first_trade_dir:
-            return False, f"Direction differente ({signal.direction} vs {self.first_trade_dir})"
-
-        # Score doit etre superieur au 1er trade + bonus
-        seuil_dca = self.first_trade_score + SCORE_DCA_BONUS
-        if signal.score < seuil_dca:
-            return False, f"Score {signal.score} < {seuil_dca} (1er={self.first_trade_score}+{SCORE_DCA_BONUS})"
-
-        # RSI doit etre ENCORE PLUS extreme
+            return False, f"Direction diff ({signal.direction} vs {self.first_trade_dir})"
+        if signal.score < SCORE_DCA_MIN:
+            return False, f"Score {signal.score} < {SCORE_DCA_MIN} (DCA exige 200+)"
         if signal.direction == "BUY" and snap.rsi_7 > RSI_BUY_DCA:
-            return False, f"RSI {snap.rsi_7:.1f} > {RSI_BUY_DCA} (pas assez bas pour DCA BUY)"
+            return False, f"RSI {snap.rsi_7:.1f} > {RSI_BUY_DCA} (pas assez bas pour DCA)"
         if signal.direction == "SELL" and snap.rsi_7 < RSI_SELL_DCA:
-            return False, f"RSI {snap.rsi_7:.1f} < {RSI_SELL_DCA} (pas assez haut pour DCA SELL)"
+            return False, f"RSI {snap.rsi_7:.1f} < {RSI_SELL_DCA} (pas assez haut pour DCA)"
+        return True, f"DCA OK: score {signal.score}>=200 + RSI {snap.rsi_7:.1f} ULTRA-EXTREME"
 
-        return True, f"DCA OK: score {signal.score} + RSI {snap.rsi_7:.1f} EXTREME, 1er a {pos.profit:.2f}$"
+    def cooldown_remaining(self) -> int:
+        if self.last_close_time == 0:
+            return 0
+        remaining = COOLDOWN_SECONDS - (time.time() - self.last_close_time)
+        return max(0, int(remaining))
+
+    def compute_lot(self, signal: Signal, atr: float, prix: float) -> float:
+        return LOT
+
+    def should_close_all(self, positions, snap: MarketSnapshot) -> Tuple[bool, str]:
+        """Sortie: Stop / Break-even / RSI securise / Trade 100% perdu"""
+        total_profit = sum(p.profit for p in positions)
+        nb_pos = len(positions)
+
+        if total_profit > self.max_profit_seen:
+            self.max_profit_seen = total_profit
+
+        # STOP
+        if nb_pos >= 2 and total_profit <= -STOP_LOSS_TOTAL:
+            return True, f"STOP TOTAL: {total_profit:.2f}$ (max -{STOP_LOSS_TOTAL}$)"
+        if nb_pos == 1 and total_profit <= -STOP_LOSS_MAX:
+            return True, f"STOP: {total_profit:.2f}$ (max -{STOP_LOSS_MAX}$)"
+
+        # BREAK-EVEN
+        if self.max_profit_seen >= 2 and total_profit <= 0:
+            return True, f"Break-even: max +{self.max_profit_seen:.2f}$, retombe {total_profit:.2f}$"
+
+        # TRADE 100% PERDU : RSI completement retourne + en perte
+        # BUY entre a RSI bas, si RSI monte a 65+ = le mouvement est parti sans nous
+        # SELL entre a RSI haut, si RSI descend a 35- = idem
+        if total_profit < -3:
+            if self.first_trade_dir == "BUY" and snap.rsi_7 >= 65:
+                return True, f"TRADE PERDU: BUY mais RSI={snap.rsi_7:.0f}>=65 {total_profit:.2f}$"
+            if self.first_trade_dir == "SELL" and snap.rsi_7 <= 35:
+                return True, f"TRADE PERDU: SELL mais RSI={snap.rsi_7:.0f}<=35 {total_profit:.2f}$"
+
+        # RSI REBONDIT = piege double-top/double-bottom
+        # SELL: RSI etait a 90, corrige a 60, remonte a 70+ = le pump continue, sortir
+        # BUY: RSI etait a 15, remonte a 40, redescend a 30- = la chute continue, sortir
+        if total_profit < 0:
+            if self.first_trade_dir == "SELL" and snap.rsi_7 >= 70:
+                return True, f"RSI REBOND SELL: RSI={snap.rsi_7:.0f}>=70 pump continue {total_profit:.2f}$"
+            if self.first_trade_dir == "BUY" and snap.rsi_7 <= 30:
+                return True, f"RSI REBOND BUY: RSI={snap.rsi_7:.0f}<=30 chute continue {total_profit:.2f}$"
+
+        # RSI securise le profit
+        if total_profit > 0:
+            if self.first_trade_dir == "BUY" and snap.rsi_7 >= 60:
+                return True, f"RSI securise BUY: RSI={snap.rsi_7:.0f}, profit +{total_profit:.2f}$"
+            if self.first_trade_dir == "SELL" and snap.rsi_7 <= 40:
+                return True, f"RSI securise SELL: RSI={snap.rsi_7:.0f}, profit +{total_profit:.2f}$"
+
+        return False, ""
 
 
 # ==============================================================
@@ -1347,11 +1348,32 @@ def get_filling_type():
 
 class OrderExecutor:
     def __init__(self):
-        self.filling_type = None  # None = ne pas envoyer (comme le script initial)
-        # Tester si filling est necessaire
+        # Detecter le filling supporte par le broker AU DEMARRAGE
+        self.filling_type = self._detect_filling()
+        filling_names = {
+            mt5.ORDER_FILLING_FOK: "FOK",
+            mt5.ORDER_FILLING_IOC: "IOC",
+            mt5.ORDER_FILLING_RETURN: "RETURN"
+        }
+        logger.info(f"Filling detecte: {filling_names.get(self.filling_type, self.filling_type)}")
+        print(f"  Filling : {filling_names.get(self.filling_type, '?')}")
+
+    def _detect_filling(self):
+        """Detecte le type de filling supporte par le symbole sur ce serveur"""
         info = mt5.symbol_info(SYMBOL)
-        if info:
-            logger.info(f"Symbol filling_mode: {info.filling_mode}")
+        if info is None:
+            return mt5.ORDER_FILLING_IOC
+
+        filling = info.filling_mode
+        logger.info(f"Symbol filling_mode brut: {filling}")
+
+        # Tester chaque mode
+        if filling & 2:  # IOC supporte (le plus courant sur XM)
+            return mt5.ORDER_FILLING_IOC
+        elif filling & 1:  # FOK supporte
+            return mt5.ORDER_FILLING_FOK
+        else:
+            return mt5.ORDER_FILLING_RETURN
 
     def _build_request(self, order_type, volume, price, position_ticket=None):
         """Construit la requete avec SL reel visible sur MT5"""
@@ -1369,44 +1391,13 @@ class OrderExecutor:
             "type": order_type,
             "price": price,
             "sl": sl,
+            "type_filling": self.filling_type,
             "deviation": 20,
             "magic": MAGIC_NUMBER
         }
         if position_ticket is not None:
             request["position"] = position_ticket
         return request
-
-    def _try_send(self, request, label):
-        """Envoie l'ordre. Si echec, retente avec type_filling"""
-        # Tentative 1 : comme le script initial (sans filling)
-        result = mt5.order_send(request)
-
-        if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-            return result
-
-        # Tentative 2 : avec type_filling IOC
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            code = result.retcode if result else 0
-            logger.warning(f"{label} tentative 1 echouee (code={code}), retry avec IOC")
-            request["type_filling"] = mt5.ORDER_FILLING_IOC
-            result = mt5.order_send(request)
-
-            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                self.filling_type = mt5.ORDER_FILLING_IOC
-                return result
-
-        # Tentative 3 : avec type_filling FOK
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            code = result.retcode if result else 0
-            logger.warning(f"{label} tentative 2 echouee (code={code}), retry avec FOK")
-            request["type_filling"] = mt5.ORDER_FILLING_FOK
-            result = mt5.order_send(request)
-
-            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                self.filling_type = mt5.ORDER_FILLING_FOK
-                return result
-
-        return result  # retourne le dernier resultat (echec)
 
     def open_order(self, direction: str, lot: float) -> bool:
         tick = mt5.symbol_info_tick(SYMBOL)
@@ -1419,13 +1410,7 @@ class OrderExecutor:
         price = tick.ask if direction == "BUY" else tick.bid
 
         request = self._build_request(order_type, lot, price)
-
-        # Si on a deja trouve un filling qui marche, l'utiliser directement
-        if self.filling_type is not None:
-            request["type_filling"] = self.filling_type
-            result = mt5.order_send(request)
-        else:
-            result = self._try_send(request, f"OPEN {direction}")
+        result = mt5.order_send(request)
 
         if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
             logger.info(f"OUVERT {direction} | Lot={lot} | Prix={price:.2f} | Ticket={result.order}")
@@ -1450,6 +1435,17 @@ class OrderExecutor:
                 print(f"      -> Activez AutoTrading dans MT5 (bouton en haut)")
             elif code == 10018:
                 print(f"      -> Le marche est ferme (weekend?)")
+            elif code == 10030:
+                print(f"      -> Filling invalide, test autres modes...")
+                # Tenter l'autre filling en secours
+                alt = mt5.ORDER_FILLING_FOK if self.filling_type == mt5.ORDER_FILLING_IOC else mt5.ORDER_FILLING_IOC
+                request["type_filling"] = alt
+                result2 = mt5.order_send(request)
+                if result2 and result2.retcode == mt5.TRADE_RETCODE_DONE:
+                    self.filling_type = alt
+                    logger.info(f"OUVERT avec filling alternatif: {alt}")
+                    print(f"      -> Reussi avec filling alternatif!")
+                    return True
         return False
 
     def close_position(self, pos, reason: str) -> bool:
@@ -1461,13 +1457,7 @@ class OrderExecutor:
         price = tick.bid if pos.type == 0 else tick.ask
 
         request = self._build_request(order_type, pos.volume, price, pos.ticket)
-
-        # Si on a deja trouve un filling qui marche, l'utiliser
-        if self.filling_type is not None:
-            request["type_filling"] = self.filling_type
-            result = mt5.order_send(request)
-        else:
-            result = self._try_send(request, "CLOSE")
+        result = mt5.order_send(request)
 
         if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
             logger.info(f"FERME | Raison: {reason} | Profit: {pos.profit:.2f}$")
@@ -1477,6 +1467,15 @@ class OrderExecutor:
             desc = MT5_ERROR_CODES.get(code, "Erreur inconnue")
             logger.error(f"ECHEC fermeture | Code={code} ({desc}) | {reason}")
             print(f"  !!! ECHEC fermeture: [{code}] {desc}")
+            # Tenter avec l'autre filling
+            if code == 10030:
+                alt = mt5.ORDER_FILLING_FOK if self.filling_type == mt5.ORDER_FILLING_IOC else mt5.ORDER_FILLING_IOC
+                request["type_filling"] = alt
+                result2 = mt5.order_send(request)
+                if result2 and result2.retcode == mt5.TRADE_RETCODE_DONE:
+                    self.filling_type = alt
+                    logger.info(f"FERME avec filling alternatif | {reason}")
+                    return True
             return False
 
 
@@ -1567,7 +1566,7 @@ class Dashboard:
                 label = "1er" if i == 0 else "DCA"
                 print(f"    [{label}] {pos_type} | Ouv: {pos.price_open:.2f} | P/L: {profit_sign}{pos.profit:.2f}${duration}")
             if risk_mgr and risk_mgr.max_profit_seen > 0:
-                print(f"  Max vu  : +{risk_mgr.max_profit_seen:.2f}$ | TP a +{FIXED_TP_AMOUNT}$ total")
+                print(f"  Max vu  : +{risk_mgr.max_profit_seen:.2f}$ | Sortie: RSI change de sens")
         else:
             print("  Aucune position ouverte")
 
@@ -1720,11 +1719,12 @@ def main():
     print(f"  Solde   : {account_info.balance:.2f}$")
     print(f"  Symbole : {SYMBOL}")
     print(f"  Lot     : {LOT} x {MAX_POSITIONS} max (DCA)")
-    print(f"  Score   : 1er >= {SCORE_MIN_ENTRY} | DCA >= 1er + {SCORE_DCA_BONUS}")
+    print(f"  Score   : 1er >= {SCORE_MIN_ENTRY} | DCA >= {SCORE_DCA_MIN}")
     print(f"  RSI BUY : 1er <= {RSI_BUY_1} | DCA <= {RSI_BUY_DCA}")
     print(f"  RSI SELL: 1er >= {RSI_SELL_1} | DCA >= {RSI_SELL_DCA}")
     print(f"  Stop    : -{STOP_LOSS_MAX}$/trade | -{STOP_LOSS_TOTAL}$ total (SL sur MT5)")
-    print(f"  TP      : +{FIXED_TP_AMOUNT}$ total (sortie profit)")
+    print(f"  Post-SL : attente RSI zone {RSI_NEUTRAL_LOW}-{RSI_NEUTRAL_HIGH} avant re-entry")
+    print(f"  TP      : RSI change de sens (profit libre)")
     print(f"  Boucle  : {LOOP_INTERVAL}s")
     print("-" * 58)
     print()
@@ -1736,8 +1736,6 @@ def main():
     dashboard = Dashboard()
     validator = DataValidator()
 
-    filling_names = {0: "FOK", 1: "IOC", 2: "RETURN", None: "AUTO (comme script initial)"}
-    print(f"  Filling : {filling_names.get(executor.filling_type, executor.filling_type)}")
     print(f"  Seuil   : {SCORE_MIN_ENTRY} (warmup {WARMUP_LOOPS} boucles avant trading)")
 
     # Check initial du fichier historique
@@ -1836,6 +1834,9 @@ def main():
             signal = signal_gen.evaluate(snap)
             positions = mt5.positions_get(symbol=SYMBOL)
 
+            # Mise a jour du RSI reset (apres SL)
+            risk_mgr.update_rsi_reset(snap.rsi_7)
+
             # Affichage
             dashboard.display(snap, signal, positions, risk_mgr)
 
@@ -1856,9 +1857,10 @@ def main():
                 should_close, reason = risk_mgr.should_close_all(positions, snap)
                 if should_close:
                     total_profit = sum(p.profit for p in positions)
+                    was_stop = "STOP" in reason
                     for pos in positions:
                         executor.close_position(pos, reason)
-                    risk_mgr.on_trade_closed(total_profit)
+                    risk_mgr.on_trade_closed(total_profit, was_stop=was_stop)
                     risk_mgr.dca_active = False
                     risk_mgr.first_trade_score = 0
                     risk_mgr.first_trade_dir = ""
@@ -1868,26 +1870,23 @@ def main():
                 elif signal.direction != "NONE" and len(positions) < MAX_POSITIONS:
                     can_dca, dca_msg = risk_mgr.can_open_dca(signal, positions, snap)
                     if can_dca:
-                        # Verifier spread avant DCA
                         spread_ok, spread_val = check_spread()
                         if spread_ok:
                             lot = LOT
                             success = executor.open_order(signal.direction, lot)
                             if success:
                                 risk_mgr.on_new_trade(signal, is_dca=True)
-                                print(f"  >>> DCA OUVERT: {signal.direction} | Score={signal.score}")
-                                logger.info(f"DCA {signal.direction} | Score={signal.score}")
+                                print(f"  >>> DCA OUVERT: {signal.direction} | Score={signal.score} | RSI={snap.rsi_7:.1f}")
+                                logger.info(f"DCA {signal.direction} | Score={signal.score} | RSI={snap.rsi_7:.1f}")
                     else:
-                        # Afficher info DCA en attente
                         total_profit = sum(p.profit for p in positions)
-                        seuil_dca = risk_mgr.first_trade_score + SCORE_DCA_BONUS
                         if len(positions) == 1 and positions[0].profit < 0:
-                            print(f"\n  DCA ATTENTE: score {signal.score}/{seuil_dca} requis")
+                            print(f"\n  DCA ATTENTE: score {signal.score}/{SCORE_DCA_MIN} + RSI={snap.rsi_7:.1f}")
                         print(f"  PROFIT TOTAL: {total_profit:+.2f}$ ({len(positions)} pos)")
 
             # --- Ouverture premiere position ---
             elif signal.direction != "NONE":
-                # Check 0: Warmup (observer le marche avant de trader)
+                # Check 0: Warmup
                 if loop_count <= WARMUP_LOOPS:
                     print(f"\n  WARMUP: observation {loop_count}/{WARMUP_LOOPS} (pas de trade)")
 
@@ -1895,22 +1894,27 @@ def main():
                 elif risk_mgr.session_stopped:
                     print(f"\n  SESSION ARRETEE: perte limite {DAILY_LOSS_LIMIT}$ atteinte")
 
-                # Check 2: Cooldown
+                # Check 2: Post-SL RSI reset (correction en cours)
+                elif risk_mgr.is_rsi_reset_blocking()[0]:
+                    _, reset_msg = risk_mgr.is_rsi_reset_blocking()
+                    print(f"\n  {reset_msg} | RSI={snap.rsi_7:.1f}")
+
+                # Check 3: Cooldown
                 elif risk_mgr.is_cooldown_active():
                     remaining = risk_mgr.cooldown_remaining()
                     print(f"\n  COOLDOWN: {remaining}s restantes")
 
-                # Check 3: Spread
+                # Check 4: Spread
                 elif not check_spread()[0]:
                     _, spread = check_spread()
                     print(f"\n  SPREAD TROP LARGE: {spread:.0f}$ > max {MAX_SPREAD_USD}$")
 
-                # Check 4: Confirmation (apres pertes)
+                # Check 5: Confirmation (apres pertes)
                 elif risk_mgr.needs_confirmation(signal):
                     print(f"\n  CONFIRMATION: signal {signal.direction} vu "
                           f"{risk_mgr.signal_confirm_count}/2 fois (apres pertes)")
 
-                # Check 5: Entree (Score + RSI extreme)
+                # Check 6: Entree (Score >= 150 + RSI extreme)
                 else:
                     can_enter, entry_msg = risk_mgr.can_enter(signal, snap)
                     print(f"\n  ENTRY: {entry_msg}")
