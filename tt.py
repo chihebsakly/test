@@ -1,9 +1,8 @@
+# -*- coding: utf-8 -*-
 """
-"""
-????????????????????????????????????????????????????????????????????
-?        BOT EXPERT TRADING BTC/USD - VERSION ULTIME              ?
-?        40+ Scénarios d'opportunité - Architecture Modulaire     ?
-????????????????????????????????????????????????????????????????????
+BOT EXPERT TRADING BTC/USD - VERSION ULTIME
+40+ Scenarios d'opportunite - Architecture Modulaire
+Lot fixe 0.05 - Solde 27$ - 1 seul trade
 """
 
 import MetaTrader5 as mt5
@@ -20,9 +19,9 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 from datetime import datetime
 
-# ??????????????????????????????????????????????????????????????
+# ==============================================================
 # CONFIGURATION GLOBALE
-# ??????????????????????????????????????????????????????????????
+# ==============================================================
 SCRIPT_DIR = os.path.join(os.path.expanduser("~"), "BotTrading")
 os.makedirs(SCRIPT_DIR, exist_ok=True)
 
@@ -30,26 +29,25 @@ SYMBOL = "BTCUSD"
 LOT = 0.05              # Lot fixe unique
 MAGIC_NUMBER = 123456
 TIMEFRAME = mt5.TIMEFRAME_M5
-HIST_BOUGIES = 2016  # 7 jours
-LOOP_INTERVAL = 2    # secondes
+HIST_BOUGIES = 2016     # 7 jours
+LOOP_INTERVAL = 2       # secondes
 LOG_FILE = os.path.join(SCRIPT_DIR, "bot_expert.log")
-SCORE_MIN_ENTRY = 55  # Seuil minimum pour entrer
-SCORE_AGGRESSIVE = 80  # Seuil mode agressif
-MAX_POSITIONS = 1     # 1 seul trade à la fois
-SOLDE = 27            # Solde du compte en $
-STOP_LOSS_MAX = 8     # Perte max en $ (protection solde)
+SCORE_MIN_ENTRY = 55    # Seuil minimum pour entrer
+SCORE_AGGRESSIVE = 80   # Seuil mode agressif
+MAX_POSITIONS = 1       # 1 seul trade a la fois
+SOLDE = 27              # Solde du compte en $
+STOP_LOSS_MAX = 8       # Perte max en $ (protection solde)
 
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
                     format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("BotExpert")
 
 
-# ??????????????????????????????????????????????????????????????
-# STRUCTURES DE DONNÉES
-# ??????????????????????????????????????????????????????????????
+# ==============================================================
+# STRUCTURES DE DONNEES
+# ==============================================================
 @dataclass
 class MarketSnapshot:
-    """Capture complète de l'état du marché à un instant T"""
     # Prix
     prix: float
     open_price: float
@@ -60,8 +58,8 @@ class MarketSnapshot:
     rsi_7: float
     rsi_14: float
     rsi_21: float
-    rsi_prev_7: float       # RSI 7 bougie précédente
-    rsi_prev_14: float      # RSI 14 bougie précédente
+    rsi_prev_7: float
+    rsi_prev_14: float
 
     # Moyennes mobiles
     ema_9: float
@@ -69,13 +67,13 @@ class MarketSnapshot:
     ema_50: float
     ema_200: float
 
-    # Volatilité
+    # Volatilite
     atr: float
-    atr_percent: float      # ATR en % du prix
+    atr_percent: float
     bollinger_upper: float
     bollinger_lower: float
     bollinger_mid: float
-    bollinger_width: float  # Largeur relative des bandes
+    bollinger_width: float
 
     # Momentum
     macd_line: float
@@ -86,20 +84,20 @@ class MarketSnapshot:
     stoch_d: float
 
     # Volume
-    volume_ratio: float     # Volume actuel vs moyenne
-    obv_slope: float        # Pente OBV (flux d'argent)
+    volume_ratio: float
+    obv_slope: float
 
-    # Mouvements de prix
-    price_change_1b: float  # % changement 1 bougie
-    price_change_3b: float  # % changement 3 bougies
-    price_change_5b: float  # % changement 5 bougies
-    price_change_12b: float # % changement 1h (12×5min)
-    price_change_24b: float # % changement 2h
+    # Mouvements de prix (%)
+    price_change_1b: float
+    price_change_3b: float
+    price_change_5b: float
+    price_change_12b: float
+    price_change_24b: float
 
-    # Mouvements relatifs à ATR (CRUCIAL pour BTC)
-    move_1b_in_atr: float   # Mouvement 1 bougie en multiples d'ATR
-    move_3b_in_atr: float   # Mouvement 3 bougies en multiples d'ATR
-    move_5b_in_atr: float   # Mouvement 5 bougies en multiples d'ATR
+    # Mouvements relatifs a ATR (CRUCIAL pour BTC)
+    move_1b_in_atr: float
+    move_3b_in_atr: float
+    move_5b_in_atr: float
 
     # Breakout / Structure
     is_new_high_2h: bool
@@ -114,10 +112,10 @@ class MarketSnapshot:
     low_4h: float
 
     # Pentes / Divergences
-    rsi_slope_5: float      # Pente RSI sur 5 bougies
-    rsi_slope_10: float     # Pente RSI sur 10 bougies
-    price_slope_5: float    # Pente prix sur 5 bougies
-    price_slope_10: float   # Pente prix sur 10 bougies
+    rsi_slope_5: float
+    rsi_slope_10: float
+    price_slope_5: float
+    price_slope_10: float
 
     # Bougies japonaises
     is_hammer: bool
@@ -125,30 +123,29 @@ class MarketSnapshot:
     is_engulfing_bull: bool
     is_engulfing_bear: bool
     is_doji: bool
-    candle_body_ratio: float  # Corps vs mèches
+    candle_body_ratio: float
 
     # Seuils adaptatifs
     quantile_high_rsi: float
     quantile_low_rsi: float
 
     # Contexte temporel
-    consecutive_green: int   # Bougies vertes consécutives
-    consecutive_red: int     # Bougies rouges consécutives
+    consecutive_green: int
+    consecutive_red: int
 
 
 @dataclass
 class Signal:
-    """Signal de trading avec score et justification"""
     direction: str          # "BUY", "SELL", "NONE"
     score: int              # 0-100+
     reasons: List[str]
     is_aggressive: bool
-    scenario_count: int     # Nombre de scénarios déclenchés
+    scenario_count: int
 
 
-# ??????????????????????????????????????????????????????????????
+# ==============================================================
 # DATA ENGINE - Calcul de tous les indicateurs
-# ??????????????????????????????????????????????????????????????
+# ==============================================================
 class DataEngine:
     def __init__(self, symbol: str, timeframe: int, history_size: int):
         self.symbol = symbol
@@ -158,7 +155,7 @@ class DataEngine:
     def get_snapshot(self) -> Optional[MarketSnapshot]:
         rates = mt5.copy_rates_from_pos(self.symbol, self.timeframe, 0, self.history_size)
         if rates is None or len(rates) < 250:
-            logger.warning("Données insuffisantes")
+            logger.warning("Donnees insuffisantes")
             return None
 
         df = pd.DataFrame(rates)
@@ -212,7 +209,7 @@ class DataEngine:
         price_change_12b = (last['close'] - df.iloc[-13]['close']) / df.iloc[-13]['close'] * 100
         price_change_24b = (last['close'] - df.iloc[-25]['close']) / df.iloc[-25]['close'] * 100
 
-        # --- Mouvements en multiples d'ATR (adaptatif à la volatilité) ---
+        # --- Mouvements en multiples d'ATR ---
         current_atr = last['atr'] if last['atr'] > 0 else 1
         move_1b_in_atr = abs(last['close'] - prev['close']) / current_atr
         move_3b_in_atr = abs(last['close'] - df.iloc[-4]['close']) / current_atr
@@ -262,7 +259,7 @@ class DataEngine:
         is_engulfing_bear = (last['close'] < last['open'] and prev['close'] > prev['open'] and
                              last['close'] < prev['open'] and last['open'] > prev['close'])
 
-        # --- Bougies consécutives ---
+        # --- Bougies consecutives ---
         consecutive_green = 0
         consecutive_red = 0
         for i in range(len(df) - 1, max(len(df) - 20, 0), -1):
@@ -348,15 +345,10 @@ class DataEngine:
         )
 
 
-# ??????????????????????????????????????????????????????????????
-# SIGNAL GENERATOR - 40+ SCÉNARIOS D'OPPORTUNITÉ
-# ??????????????????????????????????????????????????????????????
+# ==============================================================
+# SIGNAL GENERATOR - 58 SCENARIOS D'OPPORTUNITE
+# ==============================================================
 class SignalGenerator:
-    """
-    Chaque scénario ajoute un score. Le total détermine l'action.
-    Score >= 55 : Entrée standard
-    Score >= 80 : Entrée agressive (lot augmenté)
-    """
 
     def evaluate(self, snap: MarketSnapshot) -> Signal:
         buy_score = 0
@@ -364,435 +356,429 @@ class SignalGenerator:
         buy_reasons = []
         sell_reasons = []
 
-        # ????????????????????????????????????????????????????????
-        # ?  CATÉGORIE 1 : RSI - Scénarios 1 à 8               ?
-        # ????????????????????????????????????????????????????????
+        # ==========================================================
+        # CATEGORIE 1 : RSI - Scenarios 1 a 8
+        # ==========================================================
 
-        # --- Scénario 1 : RSI7 survendu adaptatif ---
+        # S1 : RSI7 survendu adaptatif
         if snap.rsi_7 <= snap.quantile_low_rsi:
             buy_score += 20
-            buy_reasons.append(f"[S1] RSI7={snap.rsi_7:.1f} <= seuil adaptatif {snap.quantile_low_rsi:.1f}")
+            buy_reasons.append(f"[S1] RSI7={snap.rsi_7:.1f} <= seuil {snap.quantile_low_rsi:.1f}")
 
-        # --- Scénario 2 : RSI7 suracheté adaptatif ---
+        # S2 : RSI7 surachete adaptatif
         if snap.rsi_7 >= snap.quantile_high_rsi:
             sell_score += 20
-            sell_reasons.append(f"[S2] RSI7={snap.rsi_7:.1f} >= seuil adaptatif {snap.quantile_high_rsi:.1f}")
+            sell_reasons.append(f"[S2] RSI7={snap.rsi_7:.1f} >= seuil {snap.quantile_high_rsi:.1f}")
 
-        # --- Scénario 3 : RSI14 zone forte achat ---
+        # S3 : RSI14 zone forte achat
         if snap.rsi_14 <= 35:
             buy_score += 15
             buy_reasons.append(f"[S3] RSI14={snap.rsi_14:.1f} survendu")
 
-        # --- Scénario 4 : RSI14 zone forte vente ---
+        # S4 : RSI14 zone forte vente
         if snap.rsi_14 >= 65:
             sell_score += 15
-            sell_reasons.append(f"[S4] RSI14={snap.rsi_14:.1f} suracheté")
+            sell_reasons.append(f"[S4] RSI14={snap.rsi_14:.1f} surachete")
 
-        # --- Scénario 5 : RSI7 extrême bas (opportunité pure) ---
+        # S5 : RSI7 extreme bas
         if snap.rsi_7 <= 25:
             buy_score += 25
-            buy_reasons.append(f"[S5] ? RSI7={snap.rsi_7:.1f} EXTRÊME BAS ? opportunité")
+            buy_reasons.append(f"[S5] RSI7={snap.rsi_7:.1f} EXTREME BAS")
 
-        # --- Scénario 6 : RSI7 extrême haut (opportunité pure) ---
+        # S6 : RSI7 extreme haut
         if snap.rsi_7 >= 75:
             sell_score += 25
-            sell_reasons.append(f"[S6] ? RSI7={snap.rsi_7:.1f} EXTRÊME HAUT ? opportunité")
+            sell_reasons.append(f"[S6] RSI7={snap.rsi_7:.1f} EXTREME HAUT")
 
-        # --- Scénario 7 : RSI rebond rapide depuis l'extrême ---
+        # S7 : RSI rebond rapide depuis extreme
         if snap.rsi_prev_7 <= 20 and snap.rsi_7 > 25:
             buy_score += 15
-            buy_reasons.append(f"[S7] RSI7 rebondit de {snap.rsi_prev_7:.1f} à {snap.rsi_7:.1f}")
+            buy_reasons.append(f"[S7] RSI7 rebondit {snap.rsi_prev_7:.1f} -> {snap.rsi_7:.1f}")
 
-        # --- Scénario 8 : RSI chute rapide depuis l'extrême ---
+        # S8 : RSI chute rapide depuis extreme
         if snap.rsi_prev_7 >= 80 and snap.rsi_7 < 75:
             sell_score += 15
-            sell_reasons.append(f"[S8] RSI7 chute de {snap.rsi_prev_7:.1f} à {snap.rsi_7:.1f}")
+            sell_reasons.append(f"[S8] RSI7 chute {snap.rsi_prev_7:.1f} -> {snap.rsi_7:.1f}")
 
-        # ????????????????????????????????????????????????????????
-        # ?  CATÉGORIE 2 : MOUVEMENT BRUSQUE - Scénarios 9 à 14?
-        # ?  Basé sur ATR (adaptatif) + % pour les gros moves   ?
-        # ????????????????????????????????????????????????????????
+        # ==========================================================
+        # CATEGORIE 2 : MOUVEMENT BRUSQUE (ATR) - Scenarios 9 a 14
+        # ==========================================================
 
-        # --- Scénario 9 : Mouvement rapide 1 bougie > 1.5×ATR (MICRO-BURST) ---
+        # S9 : Micro-burst 1 bougie > 1.5x ATR
         if snap.move_1b_in_atr >= 1.5:
             if snap.price_change_1b > 0:
-                # Hausse brusque ? potentiel continuation ou retour
                 if snap.rsi_7 < 65:
                     buy_score += 15
-                    buy_reasons.append(f"[S9] ?? Micro-burst HAUT {snap.move_1b_in_atr:.1f}×ATR, RSI frais ? continuation")
+                    buy_reasons.append(f"[S9] Micro-burst HAUT {snap.move_1b_in_atr:.1f}xATR RSI frais")
                 else:
                     sell_score += 15
-                    sell_reasons.append(f"[S9] ?? Micro-burst HAUT {snap.move_1b_in_atr:.1f}×ATR, RSI chaud ? retour")
+                    sell_reasons.append(f"[S9] Micro-burst HAUT {snap.move_1b_in_atr:.1f}xATR RSI chaud")
             else:
                 if snap.rsi_7 > 35:
                     sell_score += 15
-                    sell_reasons.append(f"[S9] ?? Micro-burst BAS {snap.move_1b_in_atr:.1f}×ATR, RSI frais ? continuation")
+                    sell_reasons.append(f"[S9] Micro-burst BAS {snap.move_1b_in_atr:.1f}xATR RSI frais")
                 else:
                     buy_score += 15
-                    buy_reasons.append(f"[S9] ?? Micro-burst BAS {snap.move_1b_in_atr:.1f}×ATR, RSI épuisé ? rebond")
+                    buy_reasons.append(f"[S9] Micro-burst BAS {snap.move_1b_in_atr:.1f}xATR RSI epuise")
 
-        # --- Scénario 10 : Mouvement 3 bougies > 2×ATR ---
+        # S10 : Rush 3 bougies > 2x ATR
         if snap.move_3b_in_atr >= 2.0:
             if snap.price_change_3b > 0:
                 if snap.rsi_7 < 70:
                     buy_score += 20
-                    buy_reasons.append(f"[S10] ?? Rush HAUT 3b = {snap.move_3b_in_atr:.1f}×ATR ? momentum")
+                    buy_reasons.append(f"[S10] Rush HAUT 3b={snap.move_3b_in_atr:.1f}xATR momentum")
                 else:
                     sell_score += 20
-                    sell_reasons.append(f"[S10] ?? Rush HAUT 3b = {snap.move_3b_in_atr:.1f}×ATR + RSI haut ? retour")
+                    sell_reasons.append(f"[S10] Rush HAUT 3b={snap.move_3b_in_atr:.1f}xATR RSI haut retour")
             else:
                 if snap.rsi_7 > 30:
                     sell_score += 20
-                    sell_reasons.append(f"[S10] ?? Chute 3b = {snap.move_3b_in_atr:.1f}×ATR ? momentum baissier")
+                    sell_reasons.append(f"[S10] Chute 3b={snap.move_3b_in_atr:.1f}xATR momentum baissier")
                 else:
                     buy_score += 20
-                    buy_reasons.append(f"[S10] ?? Chute 3b = {snap.move_3b_in_atr:.1f}×ATR + RSI bas ? rebond")
+                    buy_reasons.append(f"[S10] Chute 3b={snap.move_3b_in_atr:.1f}xATR RSI bas rebond")
 
-        # --- Scénario 11 : Mouvement 3 bougies > 3×ATR (VIOLENT) ---
+        # S11 : Mouvement violent 3b > 3x ATR
         if snap.move_3b_in_atr >= 3.0:
             if snap.price_change_3b < 0:
                 buy_score += 25
-                buy_reasons.append(f"[S11] ?? Crash violent {snap.move_3b_in_atr:.1f}×ATR ? rebond fort probable")
+                buy_reasons.append(f"[S11] CRASH violent {snap.move_3b_in_atr:.1f}xATR rebond fort")
             else:
                 sell_score += 25
-                sell_reasons.append(f"[S11] ?? Pump violent {snap.move_3b_in_atr:.1f}×ATR ? correction forte")
+                sell_reasons.append(f"[S11] PUMP violent {snap.move_3b_in_atr:.1f}xATR correction")
 
-        # --- Scénario 12 : Mouvement % 1h (garde le % pour les gros moves) ---
+        # S12 : Mouvement 1h en %
         if snap.price_change_12b <= -1.5:
             buy_score += 20
-            buy_reasons.append(f"[S12] ?? Crash 1h: {snap.price_change_12b:.2f}% ? rebond")
+            buy_reasons.append(f"[S12] Crash 1h: {snap.price_change_12b:.2f}% rebond")
         if snap.price_change_12b >= 1.5:
             sell_score += 20
-            sell_reasons.append(f"[S12] ?? Pump 1h: +{snap.price_change_12b:.2f}% ? correction")
+            sell_reasons.append(f"[S12] Pump 1h: +{snap.price_change_12b:.2f}% correction")
 
-        # --- Scénario 13 : Chute 2h progressive ---
+        # S13 : Chute 2h progressive
         if snap.price_change_24b <= -2.5:
             buy_score += 20
-            buy_reasons.append(f"[S13] ?? Chute 2h: {snap.price_change_24b:.2f}% ? zone d'achat")
+            buy_reasons.append(f"[S13] Chute 2h: {snap.price_change_24b:.2f}% zone achat")
 
-        # --- Scénario 14 : Hausse 2h progressive ---
+        # S14 : Hausse 2h progressive
         if snap.price_change_24b >= 2.5:
             sell_score += 20
-            sell_reasons.append(f"[S14] ?? Hausse 2h: +{snap.price_change_24b:.2f}% ? zone de vente")
+            sell_reasons.append(f"[S14] Hausse 2h: +{snap.price_change_24b:.2f}% zone vente")
 
-        # --- Scénario 14b : Mouvement 5 bougies > 2.5×ATR (nouveau) ---
+        # S14b : Acceleration 5b > 2.5x ATR
         if snap.move_5b_in_atr >= 2.5:
             if snap.price_change_5b > 0 and snap.rsi_7 >= 65:
                 sell_score += 15
-                sell_reasons.append(f"[S14b] Accélération 5b {snap.move_5b_in_atr:.1f}×ATR + RSI haut ? vente")
+                sell_reasons.append(f"[S14b] Accel 5b {snap.move_5b_in_atr:.1f}xATR+RSI haut vente")
             elif snap.price_change_5b < 0 and snap.rsi_7 <= 35:
                 buy_score += 15
-                buy_reasons.append(f"[S14b] Accélération 5b {snap.move_5b_in_atr:.1f}×ATR + RSI bas ? achat")
+                buy_reasons.append(f"[S14b] Accel 5b {snap.move_5b_in_atr:.1f}xATR+RSI bas achat")
 
-        # ????????????????????????????????????????????????????????
-        # ?  CATÉGORIE 3 : BREAKOUT / PIC - Scénarios 15 à 20  ?
-        # ????????????????????????????????????????????????????????
+        # ==========================================================
+        # CATEGORIE 3 : BREAKOUT / PIC - Scenarios 15 a 20
+        # ==========================================================
 
-        # --- Scénario 15 : Nouveau pic haut 2h + RSI frais ? continuation ---
+        # S15 : Nouveau pic haut 2h + RSI frais
         if snap.is_new_high_2h and snap.rsi_7 < 70:
             buy_score += 20
-            buy_reasons.append(f"[S15] ?? Breakout HAUT 2h + RSI frais ? continuation")
+            buy_reasons.append("[S15] BREAKOUT HAUT 2h + RSI frais continuation")
 
-        # --- Scénario 16 : Nouveau pic haut 2h + RSI épuisé ? retournement ---
+        # S16 : Nouveau pic haut 2h + RSI epuise
         if snap.is_new_high_2h and snap.rsi_7 >= 70:
             sell_score += 15
-            sell_reasons.append(f"[S16] ??? Pic 2h + RSI épuisé ? retournement")
+            sell_reasons.append("[S16] Pic 2h + RSI epuise retournement")
 
-        # --- Scénario 17 : Nouveau creux 2h + RSI frais ? continuation baisse ---
+        # S17 : Nouveau creux 2h + RSI frais
         if snap.is_new_low_2h and snap.rsi_7 > 30:
             sell_score += 20
-            sell_reasons.append(f"[S17] ?? Breakdown BAS 2h + RSI frais ? continuation")
+            sell_reasons.append("[S17] BREAKDOWN BAS 2h + RSI frais continuation")
 
-        # --- Scénario 18 : Nouveau creux 2h + RSI épuisé ? rebond ---
+        # S18 : Nouveau creux 2h + RSI epuise
         if snap.is_new_low_2h and snap.rsi_7 <= 30:
             buy_score += 15
-            buy_reasons.append(f"[S18] ??? Creux 2h + RSI épuisé ? rebond")
+            buy_reasons.append("[S18] Creux 2h + RSI epuise rebond")
 
-        # --- Scénario 19 : Breakout 4h haut (signal fort) ---
+        # S19 : Breakout 4h haut
         if snap.is_new_high_4h:
             if snap.rsi_7 < 75:
                 buy_score += 25
-                buy_reasons.append(f"[S19] ???? Breakout HAUT 4h ? forte continuation")
+                buy_reasons.append("[S19] BREAKOUT HAUT 4h forte continuation")
             else:
                 sell_score += 10
-                sell_reasons.append(f"[S19] Pic 4h + RSI saturé")
+                sell_reasons.append("[S19] Pic 4h + RSI sature")
 
-        # --- Scénario 20 : Breakout 4h bas (signal fort) ---
+        # S20 : Breakdown 4h bas
         if snap.is_new_low_4h:
             if snap.rsi_7 > 25:
                 sell_score += 25
-                sell_reasons.append(f"[S20] ???? Breakdown BAS 4h ? forte continuation")
+                sell_reasons.append("[S20] BREAKDOWN BAS 4h forte continuation")
             else:
                 buy_score += 10
-                buy_reasons.append(f"[S20] Creux 4h + RSI épuisé ? rebond")
+                buy_reasons.append("[S20] Creux 4h + RSI epuise rebond")
 
-        # ????????????????????????????????????????????????????????
-        # ?  CATÉGORIE 4 : DIVERGENCES - Scénarios 21 à 24     ?
-        # ????????????????????????????????????????????????????????
+        # ==========================================================
+        # CATEGORIE 4 : DIVERGENCES - Scenarios 21 a 24
+        # ==========================================================
 
-        # --- Scénario 21 : Divergence haussière courte (5 bougies) ---
+        # S21 : Divergence haussiere rapide
         if snap.rsi_slope_5 > 0.5 and snap.price_slope_5 < -0.05:
             buy_score += 20
-            buy_reasons.append(f"[S21] ?? Divergence haussière rapide RSI? Prix?")
+            buy_reasons.append("[S21] Divergence haussiere rapide RSI+ Prix-")
 
-        # --- Scénario 22 : Divergence baissière courte (5 bougies) ---
+        # S22 : Divergence baissiere rapide
         if snap.rsi_slope_5 < -0.5 and snap.price_slope_5 > 0.05:
             sell_score += 20
-            sell_reasons.append(f"[S22] ?? Divergence baissière rapide RSI? Prix?")
+            sell_reasons.append("[S22] Divergence baissiere rapide RSI- Prix+")
 
-        # --- Scénario 23 : Divergence haussière longue (10 bougies) ---
+        # S23 : Divergence haussiere longue
         if snap.rsi_slope_10 > 0.3 and snap.price_slope_10 < -0.03:
             buy_score += 15
-            buy_reasons.append(f"[S23] ?? Divergence haussière prolongée")
+            buy_reasons.append("[S23] Divergence haussiere prolongee")
 
-        # --- Scénario 24 : Divergence baissière longue (10 bougies) ---
+        # S24 : Divergence baissiere longue
         if snap.rsi_slope_10 < -0.3 and snap.price_slope_10 > 0.03:
             sell_score += 15
-            sell_reasons.append(f"[S24] ?? Divergence baissière prolongée")
+            sell_reasons.append("[S24] Divergence baissiere prolongee")
 
-        # ????????????????????????????????????????????????????????
-        # ?  CATÉGORIE 5 : BOLLINGER BANDS - Scénarios 25 à 28 ?
-        # ????????????????????????????????????????????????????????
+        # ==========================================================
+        # CATEGORIE 5 : BOLLINGER BANDS - Scenarios 25 a 28
+        # ==========================================================
 
-        # --- Scénario 25 : Prix touche bande inférieure ---
+        # S25 : Prix touche bande inferieure
         if snap.prix <= snap.bollinger_lower:
             buy_score += 15
-            buy_reasons.append(f"[S25] Prix touche Bollinger BAS ? rebond")
+            buy_reasons.append("[S25] Prix touche Bollinger BAS rebond")
 
-        # --- Scénario 26 : Prix touche bande supérieure ---
+        # S26 : Prix touche bande superieure
         if snap.prix >= snap.bollinger_upper:
             sell_score += 15
-            sell_reasons.append(f"[S26] Prix touche Bollinger HAUT ? rejet")
+            sell_reasons.append("[S26] Prix touche Bollinger HAUT rejet")
 
-        # --- Scénario 27 : Squeeze Bollinger + mouvement haussier ---
+        # S27 : Squeeze BB + mouvement haussier
         if snap.bollinger_width < 1.5 and snap.price_change_1b > 0.3:
             buy_score += 15
-            buy_reasons.append(f"[S27] ?? Squeeze BB + expansion haussière")
+            buy_reasons.append("[S27] Squeeze BB + expansion haussiere")
 
-        # --- Scénario 28 : Squeeze Bollinger + mouvement baissier ---
+        # S28 : Squeeze BB + mouvement baissier
         if snap.bollinger_width < 1.5 and snap.price_change_1b < -0.3:
             sell_score += 15
-            sell_reasons.append(f"[S28] ?? Squeeze BB + expansion baissière")
+            sell_reasons.append("[S28] Squeeze BB + expansion baissiere")
 
-        # ????????????????????????????????????????????????????????
-        # ?  CATÉGORIE 6 : MACD - Scénarios 29 à 32            ?
-        # ????????????????????????????????????????????????????????
+        # ==========================================================
+        # CATEGORIE 6 : MACD - Scenarios 29 a 32
+        # ==========================================================
 
-        # --- Scénario 29 : Croisement MACD haussier ---
+        # S29 : Croisement MACD haussier
         if snap.macd_hist > 0 and snap.macd_hist_prev <= 0:
             buy_score += 15
-            buy_reasons.append(f"[S29] ? Croisement MACD haussier")
+            buy_reasons.append("[S29] Croisement MACD haussier")
 
-        # --- Scénario 30 : Croisement MACD baissier ---
+        # S30 : Croisement MACD baissier
         if snap.macd_hist < 0 and snap.macd_hist_prev >= 0:
             sell_score += 15
-            sell_reasons.append(f"[S30] ? Croisement MACD baissier")
+            sell_reasons.append("[S30] Croisement MACD baissier")
 
-        # --- Scénario 31 : MACD histogramme croissant fort ---
-        if snap.macd_hist > 0 and snap.macd_hist > snap.macd_hist_prev * 1.5:
+        # S31 : MACD histogramme accelere haussier
+        if snap.macd_hist > 0 and snap.macd_hist_prev > 0 and snap.macd_hist > snap.macd_hist_prev * 1.5:
             buy_score += 10
-            buy_reasons.append(f"[S31] MACD momentum haussier accélère")
+            buy_reasons.append("[S31] MACD momentum haussier accelere")
 
-        # --- Scénario 32 : MACD histogramme décroissant fort ---
-        if snap.macd_hist < 0 and snap.macd_hist < snap.macd_hist_prev * 1.5:
+        # S32 : MACD histogramme accelere baissier
+        if snap.macd_hist < 0 and snap.macd_hist_prev < 0 and snap.macd_hist < snap.macd_hist_prev * 1.5:
             sell_score += 10
-            sell_reasons.append(f"[S32] MACD momentum baissier accélère")
+            sell_reasons.append("[S32] MACD momentum baissier accelere")
 
-        # ????????????????????????????????????????????????????????
-        # ?  CATÉGORIE 7 : STOCHASTIQUE - Scénarios 33 à 35    ?
-        # ????????????????????????????????????????????????????????
+        # ==========================================================
+        # CATEGORIE 7 : STOCHASTIQUE - Scenarios 33 a 35
+        # ==========================================================
 
-        # --- Scénario 33 : Stochastique survendu + croisement ---
+        # S33 : Stoch survendu + croisement
         if snap.stoch_k < 20 and snap.stoch_k > snap.stoch_d:
             buy_score += 15
-            buy_reasons.append(f"[S33] Stoch survendu + croisement haussier K={snap.stoch_k:.0f}")
+            buy_reasons.append(f"[S33] Stoch survendu + croisement K={snap.stoch_k:.0f}")
 
-        # --- Scénario 34 : Stochastique suracheté + croisement ---
+        # S34 : Stoch surachete + croisement
         if snap.stoch_k > 80 and snap.stoch_k < snap.stoch_d:
             sell_score += 15
-            sell_reasons.append(f"[S34] Stoch suracheté + croisement baissier K={snap.stoch_k:.0f}")
+            sell_reasons.append(f"[S34] Stoch surachete + croisement K={snap.stoch_k:.0f}")
 
-        # --- Scénario 35 : Double confirmation Stoch + RSI ---
+        # S35 : Double confirmation Stoch + RSI
         if snap.stoch_k < 25 and snap.rsi_7 < 30:
             buy_score += 20
-            buy_reasons.append(f"[S35] ?? Double survendu: Stoch+RSI")
+            buy_reasons.append("[S35] Double survendu: Stoch+RSI")
         if snap.stoch_k > 75 and snap.rsi_7 > 70:
             sell_score += 20
-            sell_reasons.append(f"[S35] ?? Double suracheté: Stoch+RSI")
+            sell_reasons.append("[S35] Double surachete: Stoch+RSI")
 
-        # ????????????????????????????????????????????????????????
-        # ?  CATÉGORIE 8 : VOLUME - Scénarios 36 à 38          ?
-        # ????????????????????????????????????????????????????????
+        # ==========================================================
+        # CATEGORIE 8 : VOLUME - Scenarios 36 a 38
+        # ==========================================================
 
-        # --- Scénario 36 : Volume spike (confirmation) ---
+        # S36 : Volume spike
         if snap.volume_ratio > 1.5:
             buy_score += 8
             sell_score += 8
-            buy_reasons.append(f"[S36] ?? Volume x{snap.volume_ratio:.1f}")
-            sell_reasons.append(f"[S36] ?? Volume x{snap.volume_ratio:.1f}")
+            buy_reasons.append(f"[S36] Volume x{snap.volume_ratio:.1f}")
+            sell_reasons.append(f"[S36] Volume x{snap.volume_ratio:.1f}")
 
-        # --- Scénario 37 : Volume explosion + direction ---
+        # S37 : Volume explosion + direction
         if snap.volume_ratio > 2.5 and snap.price_change_1b > 0.2:
             buy_score += 15
-            buy_reasons.append(f"[S37] ?? Volume explosion HAUSSIER x{snap.volume_ratio:.1f}")
+            buy_reasons.append(f"[S37] Volume explosion HAUSSIER x{snap.volume_ratio:.1f}")
         if snap.volume_ratio > 2.5 and snap.price_change_1b < -0.2:
             sell_score += 15
-            sell_reasons.append(f"[S37] ?? Volume explosion BAISSIER x{snap.volume_ratio:.1f}")
+            sell_reasons.append(f"[S37] Volume explosion BAISSIER x{snap.volume_ratio:.1f}")
 
-        # --- Scénario 38 : OBV confirme la direction ---
+        # S38 : OBV confirme direction
         if snap.obv_slope > 0 and snap.price_slope_5 > 0:
             buy_score += 8
-            buy_reasons.append(f"[S38] OBV confirme flux acheteur")
+            buy_reasons.append("[S38] OBV confirme flux acheteur")
         if snap.obv_slope < 0 and snap.price_slope_5 < 0:
             sell_score += 8
-            sell_reasons.append(f"[S38] OBV confirme flux vendeur")
+            sell_reasons.append("[S38] OBV confirme flux vendeur")
 
-        # ????????????????????????????????????????????????????????
-        # ?  CATÉGORIE 9 : BOUGIES JAPONAISES - Scénarios 39-42?
-        # ????????????????????????????????????????????????????????
+        # ==========================================================
+        # CATEGORIE 9 : BOUGIES JAPONAISES - Scenarios 39 a 42
+        # ==========================================================
 
-        # --- Scénario 39 : Marteau (hammer) en zone basse ---
+        # S39 : Marteau en zone basse
         if snap.is_hammer and snap.rsi_7 < 40:
             buy_score += 15
-            buy_reasons.append(f"[S39] ?? Marteau + RSI bas ? retournement haussier")
+            buy_reasons.append("[S39] Marteau + RSI bas retournement haussier")
 
-        # --- Scénario 40 : Étoile filante en zone haute ---
+        # S40 : Etoile filante en zone haute
         if snap.is_shooting_star and snap.rsi_7 > 60:
             sell_score += 15
-            sell_reasons.append(f"[S40] ? Étoile filante + RSI haut ? retournement baissier")
+            sell_reasons.append("[S40] Etoile filante + RSI haut retournement baissier")
 
-        # --- Scénario 41 : Engulfing haussier ---
+        # S41 : Engulfing haussier
         if snap.is_engulfing_bull:
             buy_score += 15
-            buy_reasons.append(f"[S41] ?? Engulfing haussier ? renversement")
+            buy_reasons.append("[S41] Engulfing haussier renversement")
 
-        # --- Scénario 42 : Engulfing baissier ---
+        # S42 : Engulfing baissier
         if snap.is_engulfing_bear:
             sell_score += 15
-            sell_reasons.append(f"[S42] ?? Engulfing baissier ? renversement")
+            sell_reasons.append("[S42] Engulfing baissier renversement")
 
-        # ????????????????????????????????????????????????????????
-        # ?  CATÉGORIE 10 : EMA (BONUS) - Scénarios 43 à 46    ?
-        # ????????????????????????????????????????????????????????
+        # ==========================================================
+        # CATEGORIE 10 : EMA (BONUS SEULEMENT) - Scenarios 43 a 46
+        # ==========================================================
 
-        # --- Scénario 43 : Prix au-dessus EMA200 (bonus tendance) ---
+        # S43 : Prix au-dessus EMA200
         if snap.prix > snap.ema_200:
             buy_score += 5
-            buy_reasons.append(f"[S43] Prix > EMA200 (tendance)")
+            buy_reasons.append("[S43] Prix > EMA200 (tendance)")
 
-        # --- Scénario 44 : Prix en-dessous EMA200 (bonus tendance) ---
+        # S44 : Prix en-dessous EMA200
         if snap.prix < snap.ema_200:
             sell_score += 5
-            sell_reasons.append(f"[S44] Prix < EMA200 (tendance)")
+            sell_reasons.append("[S44] Prix < EMA200 (tendance)")
 
-        # --- Scénario 45 : Golden cross EMA9/21 ---
+        # S45 : Golden cross EMA9/21
         if snap.ema_9 > snap.ema_21 and snap.prix > snap.ema_9:
             buy_score += 8
-            buy_reasons.append(f"[S45] EMA9 > EMA21 + Prix au-dessus")
+            buy_reasons.append("[S45] EMA9 > EMA21 + Prix au-dessus")
 
-        # --- Scénario 46 : Death cross EMA9/21 ---
+        # S46 : Death cross EMA9/21
         if snap.ema_9 < snap.ema_21 and snap.prix < snap.ema_9:
             sell_score += 8
-            sell_reasons.append(f"[S46] EMA9 < EMA21 + Prix en-dessous")
+            sell_reasons.append("[S46] EMA9 < EMA21 + Prix en-dessous")
 
-        # ????????????????????????????????????????????????????????
-        # ?  CATÉGORIE 11 : CONTEXTE / MOMENTUM - Scén. 47-52  ?
-        # ????????????????????????????????????????????????????????
+        # ==========================================================
+        # CATEGORIE 11 : CONTEXTE / MOMENTUM - Scenarios 47 a 52
+        # ==========================================================
 
-        # --- Scénario 47 : Contre-tendance RSI fort (EMA ne bloque pas) ---
+        # S47 : Contre-tendance RSI fort
         if snap.rsi_7 >= 70 and snap.prix > snap.ema_200:
             sell_score += 8
-            sell_reasons.append(f"[S47] ?? Suracheté malgré hausse ? retournement")
+            sell_reasons.append("[S47] Surachete malgre hausse retournement")
         if snap.rsi_7 <= 30 and snap.prix < snap.ema_200:
             buy_score += 8
-            buy_reasons.append(f"[S47] ?? Survendu malgré baisse ? rebond")
+            buy_reasons.append("[S47] Survendu malgre baisse rebond")
 
-        # --- Scénario 48 : Séquence bougies rouges consécutives (épuisement vendeurs) ---
+        # S48 : Sequence bougies rouges (epuisement vendeurs)
         if snap.consecutive_red >= 5:
             buy_score += 15
-            buy_reasons.append(f"[S48] {snap.consecutive_red} bougies rouges ? épuisement vendeurs")
+            buy_reasons.append(f"[S48] {snap.consecutive_red} bougies rouges epuisement vendeurs")
 
-        # --- Scénario 49 : Séquence bougies vertes consécutives (épuisement acheteurs) ---
+        # S49 : Sequence bougies vertes (epuisement acheteurs)
         if snap.consecutive_green >= 5:
             sell_score += 15
-            sell_reasons.append(f"[S49] {snap.consecutive_green} bougies vertes ? épuisement acheteurs")
+            sell_reasons.append(f"[S49] {snap.consecutive_green} bougies vertes epuisement acheteurs")
 
-        # --- Scénario 50 : Prix proche du plus bas 2h (support) ---
+        # S50 : Prix proche support 2h
         if snap.distance_from_low_2h < 0.15 and not snap.is_new_low_2h:
             buy_score += 10
             buy_reasons.append(f"[S50] Prix proche support 2h ({snap.distance_from_low_2h:.2f}%)")
 
-        # --- Scénario 51 : Prix proche du plus haut 2h (résistance) ---
+        # S51 : Prix proche resistance 2h
         if snap.distance_from_high_2h < 0.15 and not snap.is_new_high_2h:
             sell_score += 10
-            sell_reasons.append(f"[S51] Prix proche résistance 2h ({snap.distance_from_high_2h:.2f}%)")
+            sell_reasons.append(f"[S51] Prix proche resistance 2h ({snap.distance_from_high_2h:.2f}%)")
 
-        # --- Scénario 52 : Accélération soudaine (1 bougie > 2×ATR) ---
+        # S52 : Bougie geante > 2x ATR
         if snap.move_1b_in_atr >= 2.0:
             if snap.price_change_1b > 0:
                 if snap.rsi_7 < 65:
                     buy_score += 15
-                    buy_reasons.append(f"[S52] ? Bougie géante haussière {snap.move_1b_in_atr:.1f}×ATR")
+                    buy_reasons.append(f"[S52] Bougie geante haussiere {snap.move_1b_in_atr:.1f}xATR")
                 else:
                     sell_score += 10
-                    sell_reasons.append(f"[S52] Bougie géante haussière + RSI haut ? épuisement")
+                    sell_reasons.append("[S52] Bougie geante haussiere + RSI haut epuisement")
             else:
                 if snap.rsi_7 > 35:
                     sell_score += 15
-                    sell_reasons.append(f"[S52] ? Bougie géante baissière {snap.move_1b_in_atr:.1f}×ATR")
+                    sell_reasons.append(f"[S52] Bougie geante baissiere {snap.move_1b_in_atr:.1f}xATR")
                 else:
                     buy_score += 10
-                    buy_reasons.append(f"[S52] Bougie géante baissière + RSI bas ? rebond")
+                    buy_reasons.append("[S52] Bougie geante baissiere + RSI bas rebond")
 
-        # ????????????????????????????????????????????????????????
-        # ?  CATÉGORIE 12 : COMBOS RARES - Scénarios 53 à 58   ?
-        # ?  (Configurations à forte probabilité)                ?
-        # ????????????????????????????????????????????????????????
+        # ==========================================================
+        # CATEGORIE 12 : COMBOS RARES - Scenarios 53 a 58
+        # ==========================================================
 
-        # --- Scénario 53 : COMBO ULTIME BUY ---
-        # RSI extrême + Mouvement ATR fort + Volume
+        # S53 : COMBO ULTIME BUY
         if snap.rsi_7 <= 25 and snap.move_3b_in_atr >= 2.0 and snap.volume_ratio > 1.3:
             buy_score += 30
-            buy_reasons.append(f"[S53] ?? COMBO ULTIME: RSI extrême + Crash {snap.move_3b_in_atr:.1f}×ATR + Volume")
+            buy_reasons.append(f"[S53] COMBO ULTIME: RSI extreme + Crash {snap.move_3b_in_atr:.1f}xATR + Volume")
 
-        # --- Scénario 54 : COMBO ULTIME SELL ---
+        # S54 : COMBO ULTIME SELL
         if snap.rsi_7 >= 75 and snap.move_3b_in_atr >= 2.0 and snap.volume_ratio > 1.3:
             sell_score += 30
-            sell_reasons.append(f"[S54] ?? COMBO ULTIME: RSI extrême + Pump {snap.move_3b_in_atr:.1f}×ATR + Volume")
+            sell_reasons.append(f"[S54] COMBO ULTIME: RSI extreme + Pump {snap.move_3b_in_atr:.1f}xATR + Volume")
 
-        # --- Scénario 55 : Triple convergence BUY ---
-        # Stoch survendu + RSI survendu + Bollinger basse
+        # S55 : Triple convergence BUY
         if snap.stoch_k < 20 and snap.rsi_7 < 30 and snap.prix <= snap.bollinger_lower * 1.005:
             buy_score += 25
-            buy_reasons.append(f"[S55] ???? Triple convergence BUY: Stoch+RSI+BB")
+            buy_reasons.append("[S55] Triple convergence BUY: Stoch+RSI+BB")
 
-        # --- Scénario 56 : Triple convergence SELL ---
+        # S56 : Triple convergence SELL
         if snap.stoch_k > 80 and snap.rsi_7 > 70 and snap.prix >= snap.bollinger_upper * 0.995:
             sell_score += 25
-            sell_reasons.append(f"[S56] ???? Triple convergence SELL: Stoch+RSI+BB")
+            sell_reasons.append("[S56] Triple convergence SELL: Stoch+RSI+BB")
 
-        # --- Scénario 57 : Rebond sur EMA200 + confirmation ---
-        if abs(snap.prix - snap.ema_200) / snap.ema_200 < 0.002:  # Prix très proche EMA200
+        # S57 : Rebond sur EMA200
+        if abs(snap.prix - snap.ema_200) / snap.ema_200 < 0.002:
             if snap.rsi_7 < 50 and snap.prix > snap.ema_200:
                 buy_score += 15
-                buy_reasons.append(f"[S57] ?? Rebond sur EMA200 confirmé")
+                buy_reasons.append("[S57] Rebond sur EMA200 confirme")
             elif snap.rsi_7 > 50 and snap.prix < snap.ema_200:
                 sell_score += 15
-                sell_reasons.append(f"[S57] ?? Rejet EMA200 confirmé")
+                sell_reasons.append("[S57] Rejet EMA200 confirme")
 
-        # --- Scénario 58 : Doji après tendance forte (indécision ? retournement) ---
+        # S58 : Doji apres tendance forte
         if snap.is_doji:
             if snap.consecutive_red >= 3:
                 buy_score += 12
-                buy_reasons.append(f"[S58] Doji après {snap.consecutive_red} rouges ? retournement?")
+                buy_reasons.append(f"[S58] Doji apres {snap.consecutive_red} rouges retournement")
             if snap.consecutive_green >= 3:
                 sell_score += 12
-                sell_reasons.append(f"[S58] Doji après {snap.consecutive_green} vertes ? retournement?")
+                sell_reasons.append(f"[S58] Doji apres {snap.consecutive_green} vertes retournement")
 
-        # ????????????????????????????????????????????????????????
-        # ?  DÉCISION FINALE                                     ?
-        # ????????????????????????????????????????????????????????
-
+        # ==========================================================
+        # DECISION FINALE
+        # ==========================================================
         buy_scenarios = len(buy_reasons)
         sell_scenarios = len(sell_reasons)
 
@@ -807,46 +793,46 @@ class SignalGenerator:
             return Signal("NONE", best, reasons, False, count)
 
 
-# ══════════════════════════════════════════════════════════════
-# RISK MANAGER - Gestion dynamique du risque
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
+# RISK MANAGER - TP a 3 niveaux (1-5$ / 10-15$ / 25-30$)
+# ==============================================================
 class RiskManager:
     def __init__(self):
-        self.entry_score = 0       # Score au moment de l'entrée
-        self.max_profit_seen = 0   # Plus haut profit vu (trailing)
+        self.entry_score = 0
+        self.max_profit_seen = 0
 
     def on_new_trade(self, signal: Signal):
-        """Appelé quand un nouveau trade est ouvert"""
+        """Appele quand un nouveau trade est ouvert"""
         self.entry_score = signal.score
         self.max_profit_seen = 0
 
     def compute_lot(self, signal: Signal, atr: float, prix: float) -> float:
-        """Lot fixe 0.05 - Solde 27$, on ne risque pas plus"""
+        """Lot fixe 0.05"""
         return LOT
 
     def should_close(self, pos, snap: MarketSnapshot) -> Tuple[bool, str]:
         """
-        Fermeture intelligente selon la force du signal d'entrée :
-        - Signal faible (55-70)  : TP rapide, sécuriser vite (1-5$)
-        - Signal fort (70-85)    : Laisser courir vers 10-15$
-        - Signal agressif (85+)  : Viser 25-30$+ avec trailing
+        Fermeture selon force du signal d'entree :
+        - Faible (55-69)  : TP rapide 1-5$
+        - Fort (70-84)    : Laisser courir 10-15$
+        - Agressif (85+)  : Viser 25-30$
         """
         profit = pos.profit
 
-        # Mise à jour du profit max vu (pour trailing)
+        # Mise a jour profit max
         if profit > self.max_profit_seen:
             self.max_profit_seen = profit
 
-        # ═══ STOP LOSS (toujours actif) ═══
+        # === STOP LOSS (toujours actif) ===
         if profit <= -STOP_LOSS_MAX:
-            return True, f"⛔ Stop protection solde ({profit:.2f}$ / max -{STOP_LOSS_MAX}$)"
+            return True, f"STOP protection solde ({profit:.2f}$ / max -{STOP_LOSS_MAX}$)"
 
         atr_stop = snap.atr * 1.5
         estimated_loss = min(atr_stop * LOT * 10, STOP_LOSS_MAX)
         if profit <= -estimated_loss:
             return True, f"Stop ATR ({profit:.2f}$ <= -{estimated_loss:.2f}$)"
 
-        # ═══ TAKE PROFIT selon force du signal ═══
+        # === TAKE PROFIT selon force du signal ===
         if self.entry_score >= SCORE_AGGRESSIVE:
             return self._tp_aggressive(pos, snap, profit)
         elif self.entry_score >= 70:
@@ -855,7 +841,7 @@ class RiskManager:
             return self._tp_safe(pos, snap, profit)
 
     def _tp_safe(self, pos, snap, profit) -> Tuple[bool, str]:
-        """Signal faible (55-70) → TP rapide 1-5$"""
+        """Signal faible (55-69) -> TP rapide 1-5$"""
         if pos.type == 0:  # BUY
             if snap.rsi_7 >= 55 and profit >= 1.5:
                 return True, f"TP safe BUY: RSI={snap.rsi_7:.1f}, +{profit:.2f}$"
@@ -873,7 +859,7 @@ class RiskManager:
         if pos.type == 1 and snap.macd_hist > 0 and snap.macd_hist_prev <= 0 and profit >= 1:
             return True, f"TP safe MACD: +{profit:.2f}$"
 
-        # Trailing à 3$
+        # Trailing a 3$
         if profit >= 3 and 40 <= snap.rsi_7 <= 60:
             return True, f"Trailing safe: +{profit:.2f}$ + RSI neutre"
 
@@ -884,19 +870,19 @@ class RiskManager:
         return False, ""
 
     def _tp_strong(self, pos, snap, profit) -> Tuple[bool, str]:
-        """Signal fort (70-85) → Viser 10-15$"""
+        """Signal fort (70-84) -> Viser 10-15$"""
         if pos.type == 0:  # BUY
             if snap.rsi_7 >= 75 and profit >= 5:
                 return True, f"TP fort BUY: RSI={snap.rsi_7:.1f}, +{profit:.2f}$"
             if snap.rsi_7 >= 80 and profit >= 2:
-                return True, f"TP fort saturé: RSI={snap.rsi_7:.1f}"
+                return True, f"TP fort sature: RSI={snap.rsi_7:.1f}"
         elif pos.type == 1:  # SELL
             if snap.rsi_7 <= 25 and profit >= 5:
                 return True, f"TP fort SELL: RSI={snap.rsi_7:.1f}, +{profit:.2f}$"
             if snap.rsi_7 <= 20 and profit >= 2:
-                return True, f"TP fort saturé: RSI={snap.rsi_7:.1f}"
+                return True, f"TP fort sature: RSI={snap.rsi_7:.1f}"
 
-        # MACD retourne (seulement si déjà en profit)
+        # MACD retourne
         if pos.type == 0 and snap.macd_hist < 0 and snap.macd_hist_prev >= 0 and profit >= 3:
             return True, f"TP fort MACD: +{profit:.2f}$"
         if pos.type == 1 and snap.macd_hist > 0 and snap.macd_hist_prev <= 0 and profit >= 3:
@@ -908,16 +894,16 @@ class RiskManager:
 
         # Ne jamais laisser +8$ devenir 0
         if self.max_profit_seen >= 8 and profit <= 2:
-            return True, f"Protection: max {self.max_profit_seen:.2f}$ → actuel +{profit:.2f}$"
+            return True, f"Protection: max {self.max_profit_seen:.2f}$ actuel +{profit:.2f}$"
 
         # Max fort = 15$
         if profit >= 15:
-            return True, f"TP fort MAX: +{profit:.2f}$ 🎉"
+            return True, f"TP fort MAX: +{profit:.2f}$"
 
         return False, ""
 
     def _tp_aggressive(self, pos, snap, profit) -> Tuple[bool, str]:
-        """Signal agressif (85+) → Viser 25-30$+"""
+        """Signal agressif (85+) -> Viser 25-30$"""
         if pos.type == 0:  # BUY
             if snap.rsi_7 >= 85 and profit >= 10:
                 return True, f"TP agressif BUY: RSI={snap.rsi_7:.1f}, +{profit:.2f}$"
@@ -931,7 +917,7 @@ class RiskManager:
         if pos.type == 1 and snap.macd_hist > 0 and snap.macd_hist_prev <= 0 and profit >= 8:
             return True, f"TP agressif MACD: +{profit:.2f}$"
 
-        # Trailing serré : profit recule de 30% depuis le max
+        # Trailing serre : profit recule de 30% depuis le max
         if self.max_profit_seen >= 10 and profit <= self.max_profit_seen * 0.7:
             return True, f"Trailing agressif: max={self.max_profit_seen:.2f}$, actuel=+{profit:.2f}$"
 
@@ -941,14 +927,14 @@ class RiskManager:
 
         # Max agressif = 30$
         if profit >= 30:
-            return True, f"TP agressif MAX: +{profit:.2f}$ 🏆🏆"
+            return True, f"TP agressif MAX: +{profit:.2f}$"
 
         return False, ""
 
 
-# ??????????????????????????????????????????????????????????????
+# ==============================================================
 # ORDER EXECUTOR
-# ??????????????????????????????????????????????????????????????
+# ==============================================================
 class OrderExecutor:
     def open_order(self, direction: str, lot: float) -> bool:
         tick = mt5.symbol_info_tick(SYMBOL)
@@ -972,11 +958,11 @@ class OrderExecutor:
 
         result = mt5.order_send(request)
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            logger.info(f"? OUVERT {direction} | Lot={lot} | Prix={price:.2f}")
+            logger.info(f"OUVERT {direction} | Lot={lot} | Prix={price:.2f}")
             return True
         else:
             code = result.retcode if result else "None"
-            logger.error(f"? ÉCHEC {direction} | Code={code}")
+            logger.error(f"ECHEC {direction} | Code={code}")
             return False
 
     def close_position(self, pos, reason: str) -> bool:
@@ -1001,88 +987,95 @@ class OrderExecutor:
 
         result = mt5.order_send(request)
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            logger.info(f"?? FERMÉ | Raison: {reason} | Profit: {pos.profit:.2f}$")
+            logger.info(f"FERME | Raison: {reason} | Profit: {pos.profit:.2f}$")
             return True
         else:
-            logger.error(f"? Échec fermeture | Raison: {reason}")
+            logger.error(f"Echec fermeture | Raison: {reason}")
             return False
 
 
-# ??????????????????????????????????????????????????????????????
+# ==============================================================
 # AFFICHAGE DASHBOARD
-# ??????????????????????????????????????????????????????????????
+# ==============================================================
 class Dashboard:
     @staticmethod
     def display(snap: MarketSnapshot, signal: Signal, positions):
         os.system('cls' if os.name == 'nt' else 'clear')
 
-        print("????????????????????????????????????????????????????????????")
-        print("?     ?? BOT EXPERT TRADING BTC - 40+ SCÉNARIOS          ?")
-        print("????????????????????????????????????????????????????????????")
-        print(f"?  ? {datetime.now().strftime('%H:%M:%S')}                                          ?")
-        print("????????????????????????????????????????????????????????????")
-        print(f"?  ?? Prix    : {snap.prix:>10.2f} $                          ?")
-        print(f"?  ?? RSI(7)  : {snap.rsi_7:>6.1f}  | RSI(14): {snap.rsi_14:>6.1f}           ?")
-        print(f"?  ?? Stoch K : {snap.stoch_k:>6.1f}  | Stoch D: {snap.stoch_d:>6.1f}           ?")
-        print(f"?  ?? EMA9/21 : {snap.ema_9:>10.2f} / {snap.ema_21:>10.2f}       ?")
-        print(f"?  ?? EMA50   : {snap.ema_50:>10.2f} | EMA200: {snap.ema_200:>10.2f}  ?")
-        print(f"?  ?? ATR     : {snap.atr:>8.2f}  ({snap.atr_percent:.2f}%)                ?")
-        print(f"?  ?? BB      : {snap.bollinger_lower:.0f} | {snap.bollinger_mid:.0f} | {snap.bollinger_upper:.0f}    ?")
-        print(f"?  ?? MACD H  : {snap.macd_hist:>+8.2f}                            ?")
-        print(f"?  ?? Volume  : x{snap.volume_ratio:.1f}                                  ?")
-        print("????????????????????????????????????????????????????????????")
-        print(f"?  ? Prix 1b: {snap.price_change_1b:>+6.2f}% | 3b: {snap.price_change_3b:>+6.2f}%           ?")
-        print(f"?  ? Prix 1h: {snap.price_change_12b:>+6.2f}% | 2h: {snap.price_change_24b:>+6.2f}%           ?")
-        print(f"?  Move ATR  : 1b={snap.move_1b_in_atr:.1f}x | 3b={snap.move_3b_in_atr:.1f}x | 5b={snap.move_5b_in_atr:.1f}x  ?")
-        print(f"?  Bougies   : ??×{snap.consecutive_green} | ??×{snap.consecutive_red}                       ?")
+        print("=" * 58)
+        print("      BOT EXPERT TRADING BTC - 58 SCENARIOS")
+        print("      Lot: 0.05 | Solde: 27$ | 1 trade max")
+        print("=" * 58)
+        print(f"  Heure   : {datetime.now().strftime('%H:%M:%S')}")
+        print("-" * 58)
+        print(f"  Prix    : {snap.prix:>10.2f} $")
+        print(f"  RSI(7)  : {snap.rsi_7:>6.1f}  | RSI(14): {snap.rsi_14:>6.1f}")
+        print(f"  Stoch K : {snap.stoch_k:>6.1f}  | Stoch D: {snap.stoch_d:>6.1f}")
+        print(f"  EMA9/21 : {snap.ema_9:>10.2f} / {snap.ema_21:>10.2f}")
+        print(f"  EMA50   : {snap.ema_50:>10.2f} | EMA200: {snap.ema_200:>10.2f}")
+        print(f"  ATR     : {snap.atr:>8.2f}  ({snap.atr_percent:.2f}%)")
+        print(f"  BB      : {snap.bollinger_lower:.0f} | {snap.bollinger_mid:.0f} | {snap.bollinger_upper:.0f}")
+        print(f"  MACD H  : {snap.macd_hist:>+8.2f}")
+        print(f"  Volume  : x{snap.volume_ratio:.1f}")
+        print("-" * 58)
+        print(f"  D Prix 1b: {snap.price_change_1b:>+6.2f}% | 3b: {snap.price_change_3b:>+6.2f}%")
+        print(f"  D Prix 1h: {snap.price_change_12b:>+6.2f}% | 2h: {snap.price_change_24b:>+6.2f}%")
+        print(f"  Move ATR : 1b={snap.move_1b_in_atr:.1f}x | 3b={snap.move_3b_in_atr:.1f}x | 5b={snap.move_5b_in_atr:.1f}x")
+        print(f"  Bougies  : Vertes x{snap.consecutive_green} | Rouges x{snap.consecutive_red}")
 
         if snap.is_new_high_2h:
-            print("?  ?? NOUVEAU PIC HAUT 2H !                              ?")
+            print("  >>> NOUVEAU PIC HAUT 2H !")
         if snap.is_new_low_2h:
-            print("?  ?? NOUVEAU CREUX BAS 2H !                             ?")
+            print("  >>> NOUVEAU CREUX BAS 2H !")
         if snap.is_new_high_4h:
-            print("?  ???? NOUVEAU PIC HAUT 4H !                            ?")
+            print("  >>> NOUVEAU PIC HAUT 4H !")
         if snap.is_new_low_4h:
-            print("?  ???? NOUVEAU CREUX BAS 4H !                           ?")
+            print("  >>> NOUVEAU CREUX BAS 4H !")
 
-        print("????????????????????????????????????????????????????????????")
+        print("-" * 58)
 
         # Signal
-        dir_icon = "?? BUY" if signal.direction == "BUY" else "?? SELL" if signal.direction == "SELL" else "? ATTENTE"
-        print(f"?  SIGNAL: {dir_icon} | Score: {signal.score}/100 | Scénarios: {signal.scenario_count}  ?")
-
+        dir_text = f"BUY" if signal.direction == "BUY" else "SELL" if signal.direction == "SELL" else "ATTENTE"
+        mode = ""
         if signal.is_aggressive:
-            print("?  ??? MODE AGRESSIF ACTIVÉ ???                       ?")
+            mode = " [MODE AGRESSIF - TP 25-30$]"
+        elif signal.score >= 70:
+            mode = " [MODE FORT - TP 10-15$]"
+        elif signal.direction != "NONE":
+            mode = " [MODE SAFE - TP 1-5$]"
 
-        print("????????????????????????????????????????????????????????????")
-        print("?  Raisons:                                              ?")
-        for r in signal.reasons[:10]:  # Max 10 lignes affichées
-            print(f"?    ? {r[:52]:<52} ?")
+        print(f"  SIGNAL: {dir_text} | Score: {signal.score}/100 | Scenarios: {signal.scenario_count}")
+        if mode:
+            print(f"  {mode}")
 
-        print("????????????????????????????????????????????????????????????")
+        print("-" * 58)
+        print("  Raisons:")
+        for r in signal.reasons[:8]:
+            print(f"    > {r}")
+
+        print("-" * 58)
 
         # Position
         if positions:
             pos = positions[0]
             pos_type = "BUY" if pos.type == 0 else "SELL"
-            profit_icon = "??" if pos.profit >= 0 else "??"
-            print(f"?  {profit_icon} POSITION: {pos_type} | Profit: {pos.profit:>+8.2f}$          ?")
+            print(f"  POSITION: {pos_type} | Profit: {pos.profit:>+8.2f}$")
         else:
-            print("?  ?? Aucune position ouverte                           ?")
+            print("  Aucune position ouverte")
 
-        print("????????????????????????????????????????????????????????????")
+        print("=" * 58)
 
 
-# ??????????????????????????????????????????????????????????????
+# ==============================================================
 # BOUCLE PRINCIPALE
-# ??????????????????????????????????????????????????????????????
+# ==============================================================
 def main():
     if not mt5.initialize():
-        print("? Impossible de se connecter à MetaTrader 5")
+        print("ERREUR: Impossible de se connecter a MetaTrader 5")
         return
 
     if not mt5.symbol_select(SYMBOL, True):
-        print(f"? Symbole {SYMBOL} non disponible")
+        print(f"ERREUR: Symbole {SYMBOL} non disponible")
         mt5.shutdown()
         return
 
@@ -1092,8 +1085,8 @@ def main():
     executor = OrderExecutor()
     dashboard = Dashboard()
 
-    logger.info("??? BOT EXPERT V2 DÉMARRÉ - 40+ Scénarios ???")
-    print("?? Démarrage du Bot Expert Trading...")
+    logger.info("=== BOT EXPERT V2 DEMARRE - 58 Scenarios ===")
+    print("Demarrage du Bot Expert Trading...")
     time.sleep(1)
 
     try:
@@ -1101,7 +1094,7 @@ def main():
             snap = data_engine.get_snapshot()
 
             if snap is None:
-                print("? En attente de données marché...")
+                print("En attente de donnees marche...")
                 time.sleep(LOOP_INTERVAL)
                 continue
 
@@ -1119,7 +1112,7 @@ def main():
                     executor.close_position(pos, reason)
                     logger.info(f"FERMETURE: {reason}")
 
-            # --- Ouverture nouvelle position (1 seul trade max) ---
+            # --- Ouverture nouvelle position (1 seul trade) ---
             elif signal.direction != "NONE":
                 lot = risk_mgr.compute_lot(signal, snap.atr, snap.prix)
                 success = executor.open_order(signal.direction, lot)
@@ -1127,18 +1120,18 @@ def main():
                     risk_mgr.on_new_trade(signal)
                     logger.info(
                         f"OUVERTURE {signal.direction} | Score={signal.score} | "
-                        f"Scénarios={signal.scenario_count} | Lot={lot} | "
+                        f"Scenarios={signal.scenario_count} | Lot={lot} | "
                         f"Raisons: {'; '.join(signal.reasons[:5])}"
                     )
             else:
-                print(f"\n  ?? Score actuel: {signal.score}/{SCORE_MIN_ENTRY} requis")
+                print(f"\n  En attente... Score: {signal.score}/{SCORE_MIN_ENTRY} requis")
 
             time.sleep(LOOP_INTERVAL)
 
     except KeyboardInterrupt:
-        logger.info("??? BOT ARRÊTÉ PAR L'UTILISATEUR ???")
+        logger.info("=== BOT ARRETE PAR L'UTILISATEUR ===")
         mt5.shutdown()
-        print("\n?? Bot arrêté proprement.")
+        print("\nBot arrete proprement.")
     except Exception as e:
         logger.error(f"ERREUR FATALE: {e}")
         mt5.shutdown()
