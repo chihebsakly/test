@@ -1384,7 +1384,7 @@ class OrderExecutor:
 # ==============================================================
 class Dashboard:
     @staticmethod
-    def display(snap: MarketSnapshot, signal: Signal, positions):
+    def display(snap: MarketSnapshot, signal: Signal, positions, risk_mgr=None):
         os.system('cls' if os.name == 'nt' else 'clear')
 
         print("=" * 58)
@@ -1447,13 +1447,48 @@ class Dashboard:
 
         print("-" * 58)
 
-        # Position
+        # Position en cours + details temps reel
         if positions:
             pos = positions[0]
             pos_type = "BUY" if pos.type == 0 else "SELL"
-            print(f"  POSITION: {pos_type} | Profit: {pos.profit:>+8.2f}$")
+            profit_sign = "+" if pos.profit >= 0 else ""
+            duration = ""
+            try:
+                open_time = datetime.fromtimestamp(pos.time)
+                elapsed = datetime.now() - open_time
+                minutes = int(elapsed.total_seconds() // 60)
+                seconds = int(elapsed.total_seconds() % 60)
+                duration = f" | Duree: {minutes}m{seconds:02d}s"
+            except:
+                pass
+            print(f"  POSITION: {pos_type} | Lot: {pos.volume}")
+            print(f"  Prix ouv: {pos.price_open:.2f} | Prix act: {snap.prix:.2f}")
+            print(f"  Profit  : {profit_sign}{pos.profit:.2f}${duration}")
+            # Afficher trailing info
+            if risk_mgr and risk_mgr.max_profit_seen > 0:
+                mode_tp = "SAFE 1-5$"
+                if risk_mgr.entry_score >= SCORE_AGGRESSIVE:
+                    mode_tp = "AGRESSIF 25-30$"
+                elif risk_mgr.entry_score >= 70:
+                    mode_tp = "FORT 10-15$"
+                print(f"  Max vu  : +{risk_mgr.max_profit_seen:.2f}$ | Mode TP: {mode_tp}")
         else:
             print("  Aucune position ouverte")
+
+        print("-" * 58)
+
+        # Solde et equity en temps reel
+        account = mt5.account_info()
+        if account:
+            equity = account.equity
+            balance = account.balance
+            margin = account.margin
+            free_margin = account.margin_free
+            pl_total = equity - balance
+            print(f"  Solde   : {balance:.2f}$ | Equity: {equity:.2f}$")
+            print(f"  Marge   : {margin:.2f}$ | Libre: {free_margin:.2f}$")
+            if pl_total != 0:
+                print(f"  P/L ouvert: {pl_total:+.2f}$")
 
         print("=" * 58)
 
@@ -1495,14 +1530,90 @@ def reconnect_mt5() -> bool:
 # BOUCLE PRINCIPALE
 # ==============================================================
 def main():
-    if not mt5.initialize():
-        print("ERREUR: Impossible de se connecter a MetaTrader 5")
-        return
+    print("=" * 58)
+    print("  DEMARRAGE BOT EXPERT TRADING BTC")
+    print("=" * 58)
+    print()
 
-    if not mt5.symbol_select(SYMBOL, True):
-        print(f"ERREUR: Symbole {SYMBOL} non disponible")
+    # === CHECK 1 : Connexion MT5 ===
+    print("  [1/6] Connexion MetaTrader 5...", end=" ")
+    if not mt5.initialize():
+        print("ECHEC")
+        print("  ERREUR: MetaTrader 5 non demarre ou non installe")
+        print("  -> Verifiez que MT5 est ouvert et connecte")
+        return
+    print("OK")
+
+    # === CHECK 2 : Infos compte ===
+    print("  [2/6] Verification compte...", end=" ")
+    account_info = mt5.account_info()
+    if account_info is None:
+        print("ECHEC")
+        print("  ERREUR: Impossible de lire les infos du compte")
         mt5.shutdown()
         return
+    print(f"OK (Solde: {account_info.balance:.2f}$, Serveur: {account_info.server})")
+
+    # === CHECK 3 : Symbole disponible ===
+    print(f"  [3/6] Symbole {SYMBOL}...", end=" ")
+    if not mt5.symbol_select(SYMBOL, True):
+        print("ECHEC")
+        print(f"  ERREUR: {SYMBOL} non disponible sur ce serveur")
+        mt5.shutdown()
+        return
+    symbol_info = mt5.symbol_info(SYMBOL)
+    if symbol_info is None:
+        print("ECHEC")
+        mt5.shutdown()
+        return
+    print(f"OK (Spread: {symbol_info.spread} pts)")
+
+    # === CHECK 4 : Tick en temps reel ===
+    print("  [4/6] Donnees temps reel...", end=" ")
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        print("ECHEC")
+        print("  ERREUR: Pas de tick disponible (marche ferme?)")
+        mt5.shutdown()
+        return
+    tick_age = int(time.time()) - tick.time
+    if tick_age > 60:
+        print(f"ATTENTION (tick ancien: {tick_age}s)")
+        print("  Le marche est peut-etre ferme, le bot attendra des donnees")
+    else:
+        print(f"OK (Bid: {tick.bid:.2f} Ask: {tick.ask:.2f})")
+
+    # === CHECK 5 : Donnees historiques ===
+    print("  [5/6] Donnees historiques...", end=" ")
+    rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 250)
+    if rates is None or len(rates) < 250:
+        count = len(rates) if rates is not None else 0
+        print(f"ECHEC ({count}/250 bougies)")
+        print("  ERREUR: Pas assez de donnees historiques")
+        mt5.shutdown()
+        return
+    print(f"OK ({len(rates)} bougies M5 disponibles)")
+
+    # === CHECK 6 : Spread acceptable ===
+    print("  [6/6] Spread...", end=" ")
+    spread = abs(tick.ask - tick.bid)
+    if spread > MAX_SPREAD_USD:
+        print(f"ATTENTION ({spread:.1f}$ > max {MAX_SPREAD_USD}$)")
+        print("  Le bot attendra que le spread baisse pour trader")
+    else:
+        print(f"OK ({spread:.1f}$ <= max {MAX_SPREAD_USD}$)")
+
+    # === RESUME ===
+    print()
+    print("-" * 58)
+    print(f"  Compte  : {account_info.login} ({account_info.server})")
+    print(f"  Solde   : {account_info.balance:.2f}$")
+    print(f"  Symbole : {SYMBOL}")
+    print(f"  Lot     : {LOT}")
+    print(f"  Stop max: -{STOP_LOSS_MAX}$")
+    print(f"  Boucle  : {LOOP_INTERVAL}s")
+    print("-" * 58)
+    print()
 
     data_engine = DataEngine(SYMBOL, TIMEFRAME, HIST_BOUGIES)
     signal_gen = SignalGenerator()
@@ -1517,8 +1628,10 @@ def main():
     print(f"  Historique: {hist_msg}")
 
     logger.info("=== BOT EXPERT V3 DEMARRE - 64 Scenarios ===")
-    print("Demarrage du Bot Expert Trading...")
-    time.sleep(1)
+    print("\n  TOUS LES CHECKS OK - Bot demarre !")
+    print("  (Ctrl+C pour arreter)")
+    print()
+    time.sleep(2)
 
     consecutive_errors = 0
     loop_count = 0
@@ -1564,7 +1677,7 @@ def main():
             positions = mt5.positions_get(symbol=SYMBOL)
 
             # Affichage
-            dashboard.display(snap, signal, positions)
+            dashboard.display(snap, signal, positions, risk_mgr)
 
             # Afficher warnings data si present
             if data_warnings:
