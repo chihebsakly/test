@@ -37,6 +37,15 @@ SCORE_AGGRESSIVE = 80   # Seuil mode agressif
 MAX_POSITIONS = 1       # 1 seul trade a la fois
 SOLDE = 27              # Solde du compte en $
 STOP_LOSS_MAX = 8       # Perte max en $ (protection solde)
+COOLDOWN_SECONDS = 60   # Attente apres fermeture avant re-entrer
+MAX_SPREAD_USD = 50     # Spread max acceptable en $ (sinon pas de trade)
+MIN_SCORE_DIFF = 15     # Difference min entre BUY et SELL score
+TRADE_HISTORY_FILE = os.path.join(SCRIPT_DIR, "trades_history.csv")
+MAX_CONSECUTIVE_LOSSES = 3   # Apres 3 pertes d'affilee, augmenter le seuil
+DAILY_LOSS_LIMIT = 12        # Arret si perte totale session >= 12$
+DAILY_PROFIT_TARGET = 20     # Objectif journalier (info seulement)
+TIMEFRAME_CONFIRM = mt5.TIMEFRAME_M15  # Timeframe de confirmation
+TIMEFRAME_FOND = mt5.TIMEFRAME_M30     # Timeframe de fond (tendance generale)
 
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
                     format='%(asctime)s [%(levelname)s] %(message)s')
@@ -132,6 +141,18 @@ class MarketSnapshot:
     # Contexte temporel
     consecutive_green: int
     consecutive_red: int
+
+    # Multi-timeframe M15 (confirmation)
+    rsi_14_m15: float
+    ema_50_m15: float
+    ema_200_m15: float
+    macd_hist_m15: float
+    trend_m15: str          # "UP", "DOWN", "NEUTRAL"
+
+    # Multi-timeframe M30 (tendance de fond)
+    rsi_14_m30: float
+    trend_m30: str          # "UP", "DOWN", "NEUTRAL"
+    macd_hist_m30: float
 
 
 @dataclass
@@ -282,6 +303,50 @@ class DataEngine:
         # --- Bollinger width ---
         bb_width = (last['bb_upper'] - last['bb_lower']) / last['bb_mid'] * 100 if last['bb_mid'] > 0 else 0
 
+        # --- Multi-timeframe M15 ---
+        rates_m15 = mt5.copy_rates_from_pos(self.symbol, TIMEFRAME_CONFIRM, 0, 200)
+        rsi_14_m15 = 50.0
+        ema_50_m15 = last['close']
+        ema_200_m15 = last['close']
+        macd_hist_m15 = 0.0
+        trend_m15 = "NEUTRAL"
+        if rates_m15 is not None and len(rates_m15) >= 200:
+            df_m15 = pd.DataFrame(rates_m15)
+            df_m15['rsi_14'] = RSIIndicator(df_m15['close'], 14).rsi()
+            df_m15['ema_50'] = EMAIndicator(df_m15['close'], 50).ema_indicator()
+            df_m15['ema_200'] = EMAIndicator(df_m15['close'], 200).ema_indicator()
+            macd_m15 = MACD(df_m15['close'])
+            df_m15['macd_hist'] = macd_m15.macd_diff()
+            last_m15 = df_m15.iloc[-1]
+            rsi_14_m15 = last_m15['rsi_14']
+            ema_50_m15 = last_m15['ema_50']
+            ema_200_m15 = last_m15['ema_200']
+            macd_hist_m15 = last_m15['macd_hist']
+            if last_m15['ema_50'] > last_m15['ema_200'] and last_m15['close'] > last_m15['ema_50']:
+                trend_m15 = "UP"
+            elif last_m15['ema_50'] < last_m15['ema_200'] and last_m15['close'] < last_m15['ema_50']:
+                trend_m15 = "DOWN"
+
+        # --- Multi-timeframe M30 (tendance de fond) ---
+        rates_m30 = mt5.copy_rates_from_pos(self.symbol, TIMEFRAME_FOND, 0, 200)
+        rsi_14_m30 = 50.0
+        macd_hist_m30 = 0.0
+        trend_m30 = "NEUTRAL"
+        if rates_m30 is not None and len(rates_m30) >= 200:
+            df_m30 = pd.DataFrame(rates_m30)
+            df_m30['rsi_14'] = RSIIndicator(df_m30['close'], 14).rsi()
+            df_m30['ema_50'] = EMAIndicator(df_m30['close'], 50).ema_indicator()
+            df_m30['ema_200'] = EMAIndicator(df_m30['close'], 200).ema_indicator()
+            macd_m30 = MACD(df_m30['close'])
+            df_m30['macd_hist'] = macd_m30.macd_diff()
+            last_m30 = df_m30.iloc[-1]
+            rsi_14_m30 = last_m30['rsi_14']
+            macd_hist_m30 = last_m30['macd_hist']
+            if last_m30['ema_50'] > last_m30['ema_200'] and last_m30['close'] > last_m30['ema_50']:
+                trend_m30 = "UP"
+            elif last_m30['ema_50'] < last_m30['ema_200'] and last_m30['close'] < last_m30['ema_50']:
+                trend_m30 = "DOWN"
+
         return MarketSnapshot(
             prix=last['close'],
             open_price=last['open'],
@@ -341,12 +406,167 @@ class DataEngine:
             quantile_high_rsi=q_high,
             quantile_low_rsi=q_low,
             consecutive_green=consecutive_green,
-            consecutive_red=consecutive_red
+            consecutive_red=consecutive_red,
+            rsi_14_m15=rsi_14_m15,
+            ema_50_m15=ema_50_m15,
+            ema_200_m15=ema_200_m15,
+            macd_hist_m15=macd_hist_m15,
+            trend_m15=trend_m15,
+            rsi_14_m30=rsi_14_m30,
+            trend_m30=trend_m30,
+            macd_hist_m30=macd_hist_m30
         )
 
 
 # ==============================================================
-# SIGNAL GENERATOR - 58 SCENARIOS D'OPPORTUNITE
+# DATA VALIDATOR - Verification integrite des donnees
+# ==============================================================
+class DataValidator:
+    """Verifie que les donnees historiques sont fiables avant de trader"""
+
+    def __init__(self):
+        self.last_valid_price = 0
+        self.last_data_time = 0
+        self.data_warnings = []
+
+    def validate_snapshot(self, snap: MarketSnapshot) -> Tuple[bool, List[str]]:
+        """Verifie la coherence du snapshot. Retourne (ok, warnings)"""
+        warnings = []
+
+        # 1. Prix aberrant (0 ou negatif)
+        if snap.prix <= 0:
+            warnings.append("CRITIQUE: Prix <= 0")
+            return False, warnings
+
+        # 2. Prix a change de plus de 10% depuis derniere lecture (anomalie)
+        if self.last_valid_price > 0:
+            change_pct = abs(snap.prix - self.last_valid_price) / self.last_valid_price * 100
+            if change_pct > 10:
+                warnings.append(f"CRITIQUE: Prix change de {change_pct:.1f}% en 2s (anomalie)")
+                return False, warnings
+
+        # 3. RSI hors limites (doit etre 0-100)
+        if not (0 <= snap.rsi_7 <= 100) or not (0 <= snap.rsi_14 <= 100):
+            warnings.append(f"CRITIQUE: RSI hors limites (RSI7={snap.rsi_7:.1f}, RSI14={snap.rsi_14:.1f})")
+            return False, warnings
+
+        # 4. ATR negatif ou zero (impossible)
+        if snap.atr <= 0:
+            warnings.append("CRITIQUE: ATR <= 0")
+            return False, warnings
+
+        # 5. Donnees gelees (meme prix que la derniere fois = marche ferme?)
+        if self.last_valid_price > 0 and snap.prix == self.last_valid_price:
+            elapsed = time.time() - self.last_data_time
+            if elapsed > 60:  # Meme prix depuis > 60s
+                warnings.append(f"ATTENTION: Prix inchange depuis {elapsed:.0f}s (marche gele?)")
+                # Pas critique, on continue mais avec avertissement
+
+        # 6. Volume zero (pas de marche)
+        if snap.volume_ratio <= 0:
+            warnings.append("ATTENTION: Volume = 0")
+
+        # 7. Bollinger inversees (anomalie indicateur)
+        if snap.bollinger_upper < snap.bollinger_lower:
+            warnings.append("CRITIQUE: Bollinger inversees")
+            return False, warnings
+
+        # 8. EMA200 aberrante (trop loin du prix = donnees insuffisantes)
+        if snap.ema_200 > 0:
+            ema_dist = abs(snap.prix - snap.ema_200) / snap.prix * 100
+            if ema_dist > 20:
+                warnings.append(f"ATTENTION: EMA200 a {ema_dist:.1f}% du prix (donnees recentes?)")
+
+        # 9. Stochastique hors limites
+        if not (0 <= snap.stoch_k <= 100) or not (0 <= snap.stoch_d <= 100):
+            warnings.append(f"ATTENTION: Stoch hors limites K={snap.stoch_k:.1f} D={snap.stoch_d:.1f}")
+
+        # Tout est OK, mettre a jour
+        self.last_valid_price = snap.prix
+        self.last_data_time = time.time()
+        self.data_warnings = warnings
+
+        return True, warnings
+
+    def validate_trade_history(self) -> Tuple[bool, str]:
+        """Verifie que le fichier trades_history.csv est valide"""
+        if not os.path.exists(TRADE_HISTORY_FILE):
+            return True, "Pas de fichier historique (premier lancement)"
+
+        try:
+            size = os.path.getsize(TRADE_HISTORY_FILE)
+            if size == 0:
+                return True, "Fichier historique vide"
+
+            # Lire et verifier le format
+            df = pd.read_csv(TRADE_HISTORY_FILE)
+
+            # Verifier colonnes attendues
+            expected_cols = ['date', 'profit', 'cumul', 'trades', 'wins']
+            if not all(col in df.columns for col in expected_cols):
+                # Fichier corrompu, le recreer
+                os.rename(TRADE_HISTORY_FILE, TRADE_HISTORY_FILE + ".bak")
+                return False, "Fichier historique corrompu (backup cree, nouveau fichier)"
+
+            # Verifier coherence: wins <= trades
+            if len(df) > 0:
+                last_row = df.iloc[-1]
+                if last_row['wins'] > last_row['trades']:
+                    return False, "Incoherence: wins > trades dans historique"
+
+            # Verifier taille (limiter a 1000 lignes max)
+            if len(df) > 1000:
+                # Garder les 500 derniers
+                df.tail(500).to_csv(TRADE_HISTORY_FILE, index=False)
+                return True, f"Historique tronque: {len(df)} -> 500 lignes"
+
+            return True, f"Historique OK: {len(df)} trades, cumul={last_row['cumul']:.2f}$"
+
+        except Exception as e:
+            return False, f"Erreur lecture historique: {e}"
+
+    def check_mt5_connection(self) -> Tuple[bool, str]:
+        """Verifie que MT5 est toujours connecte et que le symbole est actif"""
+        info = mt5.symbol_info(SYMBOL)
+        if info is None:
+            return False, "Symbole non disponible"
+
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if tick is None:
+            return False, "Tick non disponible"
+
+        # Verifier que le tick n'est pas trop vieux (> 30s)
+        tick_time = tick.time
+        now = int(time.time())
+        if now - tick_time > 30:
+            return False, f"Tick ancien: {now - tick_time}s (marche ferme?)"
+
+        return True, "MT5 OK"
+
+    def full_check(self, snap: Optional[MarketSnapshot] = None) -> Tuple[bool, List[str]]:
+        """Check complet : MT5 + donnees + historique"""
+        all_warnings = []
+
+        # Check MT5
+        mt5_ok, mt5_msg = self.check_mt5_connection()
+        if not mt5_ok:
+            all_warnings.append(f"MT5: {mt5_msg}")
+            return False, all_warnings
+
+        # Check snapshot
+        if snap is not None:
+            snap_ok, snap_warnings = self.validate_snapshot(snap)
+            all_warnings.extend(snap_warnings)
+            if not snap_ok:
+                return False, all_warnings
+
+        # Check historique (toutes les 50 iterations = ~100s)
+        # On ne le fait pas a chaque boucle pour la perf
+        return True, all_warnings
+
+
+# ==============================================================
+# SIGNAL GENERATOR - 64 SCENARIOS D'OPPORTUNITE
 # ==============================================================
 class SignalGenerator:
 
@@ -777,10 +997,90 @@ class SignalGenerator:
                 sell_reasons.append(f"[S58] Doji apres {snap.consecutive_green} vertes retournement")
 
         # ==========================================================
-        # DECISION FINALE
+        # CATEGORIE 13 : MULTI-TIMEFRAME M15 - Scenarios 59 a 62
+        # ==========================================================
+
+        # S59 : Tendance M15 confirme BUY
+        if snap.trend_m15 == "UP":
+            buy_score += 10
+            buy_reasons.append("[S59] M15 tendance HAUSSIERE confirme")
+
+        # S60 : Tendance M15 confirme SELL
+        if snap.trend_m15 == "DOWN":
+            sell_score += 10
+            sell_reasons.append("[S60] M15 tendance BAISSIERE confirme")
+
+        # S61 : RSI M15 survendu confirme achat M5
+        if snap.rsi_14_m15 <= 35 and snap.rsi_7 <= 35:
+            buy_score += 15
+            buy_reasons.append(f"[S61] M15 RSI={snap.rsi_14_m15:.0f} confirme survendu")
+
+        # S62 : RSI M15 surachete confirme vente M5
+        if snap.rsi_14_m15 >= 65 and snap.rsi_7 >= 65:
+            sell_score += 15
+            sell_reasons.append(f"[S62] M15 RSI={snap.rsi_14_m15:.0f} confirme surachete")
+
+        # S63 : MACD M15 confirme direction M5
+        if snap.macd_hist_m15 > 0 and snap.macd_hist > 0:
+            buy_score += 8
+            buy_reasons.append("[S63] MACD M15+M5 haussier aligne")
+        if snap.macd_hist_m15 < 0 and snap.macd_hist < 0:
+            sell_score += 8
+            sell_reasons.append("[S63] MACD M15+M5 baissier aligne")
+
+        # S64 : Contre-tendance M15 (signal fort si M5 diverge de M15)
+        # Si M15 est DOWN mais M5 donne un BUY fort = rebond puissant
+        if snap.trend_m15 == "DOWN" and snap.rsi_7 <= 25:
+            buy_score += 10
+            buy_reasons.append("[S64] Contre-tendance M15: RSI extreme malgre baisse")
+        if snap.trend_m15 == "UP" and snap.rsi_7 >= 75:
+            sell_score += 10
+            sell_reasons.append("[S64] Contre-tendance M15: RSI extreme malgre hausse")
+
+        # ==========================================================
+        # CATEGORIE 14 : MULTI-TIMEFRAME M30 (FOND) - Scenarios 65 a 68
+        # ==========================================================
+
+        # S65 : Triple alignement M5+M15+M30 HAUSSIER (tres fort)
+        if snap.trend_m15 == "UP" and snap.trend_m30 == "UP":
+            buy_score += 12
+            buy_reasons.append("[S65] TRIPLE ALIGNEMENT M5+M15+M30 HAUSSIER")
+
+        # S66 : Triple alignement M5+M15+M30 BAISSIER (tres fort)
+        if snap.trend_m15 == "DOWN" and snap.trend_m30 == "DOWN":
+            sell_score += 12
+            sell_reasons.append("[S66] TRIPLE ALIGNEMENT M5+M15+M30 BAISSIER")
+
+        # S67 : RSI M30 confirme zone extreme
+        if snap.rsi_14_m30 <= 35 and snap.rsi_7 <= 35:
+            buy_score += 12
+            buy_reasons.append(f"[S67] M30 RSI={snap.rsi_14_m30:.0f} confirme survendu profond")
+        if snap.rsi_14_m30 >= 65 and snap.rsi_7 >= 65:
+            sell_score += 12
+            sell_reasons.append(f"[S67] M30 RSI={snap.rsi_14_m30:.0f} confirme surachete profond")
+
+        # S68 : Signal contre la tendance M30 (prudence ou opportunite)
+        # Si M30 monte mais signal SELL sur M5 = trade plus risque, reduire score
+        if snap.trend_m30 == "UP" and sell_score > buy_score:
+            sell_score -= 5
+            sell_reasons.append("[S68] -5 M30 haussier: SELL contre tendance fond")
+        if snap.trend_m30 == "DOWN" and buy_score > sell_score:
+            buy_score -= 5
+            buy_reasons.append("[S68] -5 M30 baissier: BUY contre tendance fond")
+
+        # ==========================================================
+        # DECISION FINALE (avec filtre conflit)
         # ==========================================================
         buy_scenarios = len(buy_reasons)
         sell_scenarios = len(sell_reasons)
+
+        # Filtre conflit : si BUY et SELL sont trop proches, ne pas entrer
+        score_diff = abs(buy_score - sell_score)
+        if score_diff < MIN_SCORE_DIFF and buy_score >= SCORE_MIN_ENTRY and sell_score >= SCORE_MIN_ENTRY:
+            # Signal ambigu, on attend
+            best = max(buy_score, sell_score)
+            reasons = [f"[CONFLIT] BUY={buy_score} vs SELL={sell_score} (diff={score_diff} < {MIN_SCORE_DIFF})"]
+            return Signal("NONE", best, reasons, False, 0)
 
         if buy_score >= SCORE_MIN_ENTRY and buy_score > sell_score:
             return Signal("BUY", buy_score, buy_reasons, buy_score >= SCORE_AGGRESSIVE, buy_scenarios)
@@ -800,11 +1100,91 @@ class RiskManager:
     def __init__(self):
         self.entry_score = 0
         self.max_profit_seen = 0
+        self.last_close_time = 0    # Timestamp derniere fermeture
+        self.total_profit = 0       # Profit cumule session
+        self.trade_count = 0        # Nombre de trades
+        self.win_count = 0          # Trades gagnants
+        self.consecutive_losses = 0 # Pertes consecutives
+        self.session_stopped = False # Session arretee (limite pertes)
+        self.last_signal_dir = ""   # Derniere direction signalee
+        self.signal_confirm_count = 0  # Compteur confirmation
 
     def on_new_trade(self, signal: Signal):
         """Appele quand un nouveau trade est ouvert"""
         self.entry_score = signal.score
         self.max_profit_seen = 0
+
+    def on_trade_closed(self, profit: float):
+        """Appele quand un trade est ferme - historique"""
+        self.last_close_time = time.time()
+        self.total_profit += profit
+        self.trade_count += 1
+        if profit > 0:
+            self.win_count += 1
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+
+        # Verifier limite perte session
+        if self.total_profit <= -DAILY_LOSS_LIMIT:
+            self.session_stopped = True
+            logger.warning(f"SESSION ARRETEE: perte totale {self.total_profit:.2f}$ >= limite {DAILY_LOSS_LIMIT}$")
+
+        # Sauvegarder dans CSV
+        try:
+            header_needed = not os.path.exists(TRADE_HISTORY_FILE) or os.path.getsize(TRADE_HISTORY_FILE) == 0
+            row = f"{datetime.now()},{profit:.2f},{self.total_profit:.2f},{self.trade_count},{self.win_count}\n"
+            with open(TRADE_HISTORY_FILE, 'a') as f:
+                if header_needed:
+                    f.write("date,profit,cumul,trades,wins\n")
+                f.write(row)
+        except:
+            pass
+
+    def get_adjusted_score_min(self) -> int:
+        """Score minimum adaptatif : plus strict apres des pertes"""
+        if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+            # Apres 3 pertes, on augmente le seuil de 15 points
+            return SCORE_MIN_ENTRY + 15
+        elif self.consecutive_losses >= 2:
+            # Apres 2 pertes, +10 points
+            return SCORE_MIN_ENTRY + 10
+        return SCORE_MIN_ENTRY
+
+    def needs_confirmation(self, signal: Signal) -> bool:
+        """
+        Apres des pertes, exiger que le signal soit present 2 fois d'affilee
+        pour confirmer avant d'entrer
+        """
+        if self.consecutive_losses < 2:
+            # Pas de confirmation requise si on gagne
+            self.last_signal_dir = signal.direction
+            return False
+
+        # Apres 2+ pertes : exiger confirmation
+        if signal.direction == self.last_signal_dir:
+            self.signal_confirm_count += 1
+        else:
+            self.signal_confirm_count = 0
+            self.last_signal_dir = signal.direction
+
+        # Il faut 2 lectures consecutives dans la meme direction
+        return self.signal_confirm_count < 2
+
+    def is_cooldown_active(self) -> bool:
+        """Verifie si on est en periode de cooldown"""
+        if self.last_close_time == 0:
+            return False
+        elapsed = time.time() - self.last_close_time
+        return elapsed < COOLDOWN_SECONDS
+
+    def cooldown_remaining(self) -> int:
+        """Secondes restantes de cooldown"""
+        if self.last_close_time == 0:
+            return 0
+        elapsed = time.time() - self.last_close_time
+        remaining = COOLDOWN_SECONDS - elapsed
+        return max(0, int(remaining))
 
     def compute_lot(self, signal: Signal, atr: float, prix: float) -> float:
         """Lot fixe 0.05"""
@@ -831,6 +1211,11 @@ class RiskManager:
         estimated_loss = min(atr_stop * LOT * 10, STOP_LOSS_MAX)
         if profit <= -estimated_loss:
             return True, f"Stop ATR ({profit:.2f}$ <= -{estimated_loss:.2f}$)"
+
+        # === BREAK-EVEN : deplacer stop a 0 des +2$ ===
+        # Si on a vu +2$ et qu'on retombe a 0 ou negatif, fermer
+        if self.max_profit_seen >= 2 and profit <= 0:
+            return True, f"Break-even: max vu +{self.max_profit_seen:.2f}$, retombe a {profit:.2f}$"
 
         # === TAKE PROFIT selon force du signal ===
         if self.entry_score >= SCORE_AGGRESSIVE:
@@ -1003,7 +1388,7 @@ class Dashboard:
         os.system('cls' if os.name == 'nt' else 'clear')
 
         print("=" * 58)
-        print("      BOT EXPERT TRADING BTC - 58 SCENARIOS")
+        print("      BOT EXPERT TRADING BTC - 64 SCENARIOS")
         print("      Lot: 0.05 | Solde: 27$ | 1 trade max")
         print("=" * 58)
         print(f"  Heure   : {datetime.now().strftime('%H:%M:%S')}")
@@ -1022,6 +1407,8 @@ class Dashboard:
         print(f"  D Prix 1h: {snap.price_change_12b:>+6.2f}% | 2h: {snap.price_change_24b:>+6.2f}%")
         print(f"  Move ATR : 1b={snap.move_1b_in_atr:.1f}x | 3b={snap.move_3b_in_atr:.1f}x | 5b={snap.move_5b_in_atr:.1f}x")
         print(f"  Bougies  : Vertes x{snap.consecutive_green} | Rouges x{snap.consecutive_red}")
+        print(f"  M15 Trend: {snap.trend_m15} | M15 RSI: {snap.rsi_14_m15:.1f} | M15 MACD: {snap.macd_hist_m15:+.1f}")
+        print(f"  M30 Trend: {snap.trend_m30} | M30 RSI: {snap.rsi_14_m30:.1f} | M30 MACD: {snap.macd_hist_m30:+.1f}")
 
         if snap.is_new_high_2h:
             print("  >>> NOUVEAU PIC HAUT 2H !")
@@ -1065,6 +1452,39 @@ class Dashboard:
 
         print("=" * 58)
 
+    @staticmethod
+    def display_data_warnings(warnings: List[str]):
+        """Affiche les avertissements sur les donnees"""
+        if warnings:
+            print("  [DATA CHECK]")
+            for w in warnings:
+                print(f"    ! {w}")
+            print("-" * 58)
+
+
+# ==============================================================
+# FONCTIONS UTILITAIRES
+# ==============================================================
+def check_spread() -> Tuple[bool, float]:
+    """Verifie que le spread est acceptable"""
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        return False, 0
+    spread = abs(tick.ask - tick.bid)
+    return spread <= MAX_SPREAD_USD, spread
+
+
+def reconnect_mt5() -> bool:
+    """Tentative de reconnexion a MT5"""
+    logger.warning("Tentative de reconnexion MT5...")
+    mt5.shutdown()
+    time.sleep(5)
+    if mt5.initialize():
+        mt5.symbol_select(SYMBOL, True)
+        logger.info("Reconnexion MT5 reussie")
+        return True
+    return False
+
 
 # ==============================================================
 # BOUCLE PRINCIPALE
@@ -1084,19 +1504,56 @@ def main():
     risk_mgr = RiskManager()
     executor = OrderExecutor()
     dashboard = Dashboard()
+    validator = DataValidator()
 
-    logger.info("=== BOT EXPERT V2 DEMARRE - 58 Scenarios ===")
+    # Check initial du fichier historique
+    hist_ok, hist_msg = validator.validate_trade_history()
+    logger.info(f"Historique: {hist_msg}")
+    print(f"  Historique: {hist_msg}")
+
+    logger.info("=== BOT EXPERT V3 DEMARRE - 64 Scenarios ===")
     print("Demarrage du Bot Expert Trading...")
     time.sleep(1)
 
+    consecutive_errors = 0
+    loop_count = 0
+
     try:
         while True:
+            # --- Reconnexion automatique ---
             snap = data_engine.get_snapshot()
-
             if snap is None:
-                print("En attente de donnees marche...")
+                consecutive_errors += 1
+                if consecutive_errors >= 5:
+                    print("Connexion perdue, reconnexion...")
+                    if not reconnect_mt5():
+                        print("Echec reconnexion, attente 30s...")
+                        time.sleep(30)
+                        continue
+                    consecutive_errors = 0
+                else:
+                    print("En attente de donnees marche...")
+                    time.sleep(LOOP_INTERVAL)
+                continue
+
+            consecutive_errors = 0
+            loop_count += 1
+
+            # --- Validation des donnees ---
+            data_ok, data_warnings = validator.full_check(snap)
+            if not data_ok:
+                print("DONNEES INVALIDES:")
+                for w in data_warnings:
+                    print(f"  ! {w}")
+                    logger.warning(f"DATA: {w}")
                 time.sleep(LOOP_INTERVAL)
                 continue
+
+            # Check historique toutes les 50 boucles (~100s)
+            if loop_count % 50 == 0:
+                hist_ok, hist_msg = validator.validate_trade_history()
+                if not hist_ok:
+                    logger.warning(f"HISTORIQUE: {hist_msg}")
 
             signal = signal_gen.evaluate(snap)
             positions = mt5.positions_get(symbol=SYMBOL)
@@ -1104,34 +1561,85 @@ def main():
             # Affichage
             dashboard.display(snap, signal, positions)
 
+            # Afficher warnings data si present
+            if data_warnings:
+                dashboard.display_data_warnings(data_warnings)
+
+            # Afficher stats session
+            if risk_mgr.trade_count > 0:
+                winrate = risk_mgr.win_count / risk_mgr.trade_count * 100
+                print(f"  SESSION: {risk_mgr.trade_count} trades | "
+                      f"Profit: {risk_mgr.total_profit:+.2f}$ | "
+                      f"Winrate: {winrate:.0f}%")
+
             # --- Gestion position existante ---
             if positions:
                 pos = positions[0]
                 should_close, reason = risk_mgr.should_close(pos, snap)
                 if should_close:
+                    profit_before = pos.profit
                     executor.close_position(pos, reason)
+                    risk_mgr.on_trade_closed(profit_before)
                     logger.info(f"FERMETURE: {reason}")
 
             # --- Ouverture nouvelle position (1 seul trade) ---
             elif signal.direction != "NONE":
-                lot = risk_mgr.compute_lot(signal, snap.atr, snap.prix)
-                success = executor.open_order(signal.direction, lot)
-                if success:
-                    risk_mgr.on_new_trade(signal)
-                    logger.info(
-                        f"OUVERTURE {signal.direction} | Score={signal.score} | "
-                        f"Scenarios={signal.scenario_count} | Lot={lot} | "
-                        f"Raisons: {'; '.join(signal.reasons[:5])}"
-                    )
+                # Check 0: Session arretee
+                if risk_mgr.session_stopped:
+                    print(f"\n  SESSION ARRETEE: perte limite {DAILY_LOSS_LIMIT}$ atteinte")
+
+                # Check 1: Cooldown
+                elif risk_mgr.is_cooldown_active():
+                    remaining = risk_mgr.cooldown_remaining()
+                    print(f"\n  COOLDOWN: {remaining}s restantes")
+
+                # Check 2: Spread
+                elif not check_spread()[0]:
+                    _, spread = check_spread()
+                    print(f"\n  SPREAD TROP LARGE: {spread:.0f}$ > max {MAX_SPREAD_USD}$")
+
+                # Check 3: Score adaptatif (plus strict apres pertes)
+                elif signal.score < risk_mgr.get_adjusted_score_min():
+                    adj_min = risk_mgr.get_adjusted_score_min()
+                    print(f"\n  SCORE INSUFFISANT apres pertes: {signal.score}/{adj_min} "
+                          f"(+{adj_min - SCORE_MIN_ENTRY} cause {risk_mgr.consecutive_losses} pertes)")
+
+                # Check 4: Confirmation (apres pertes, attendre 2 signaux identiques)
+                elif risk_mgr.needs_confirmation(signal):
+                    print(f"\n  CONFIRMATION: signal {signal.direction} vu "
+                          f"{risk_mgr.signal_confirm_count}/2 fois (apres pertes)")
+
+                # Check 5: Entree validee
+                else:
+                    lot = risk_mgr.compute_lot(signal, snap.atr, snap.prix)
+                    success = executor.open_order(signal.direction, lot)
+                    if success:
+                        risk_mgr.on_new_trade(signal)
+                        risk_mgr.signal_confirm_count = 0
+                        logger.info(
+                            f"OUVERTURE {signal.direction} | Score={signal.score} | "
+                            f"Scenarios={signal.scenario_count} | Lot={lot} | "
+                            f"Raisons: {'; '.join(signal.reasons[:5])}"
+                        )
             else:
-                print(f"\n  En attente... Score: {signal.score}/{SCORE_MIN_ENTRY} requis")
+                # Afficher info
+                adj_min = risk_mgr.get_adjusted_score_min()
+                extra = ""
+                if risk_mgr.consecutive_losses >= 2:
+                    extra = f" (seuil +{adj_min - SCORE_MIN_ENTRY} apres {risk_mgr.consecutive_losses} pertes)"
+                if risk_mgr.is_cooldown_active():
+                    print(f"\n  COOLDOWN: {risk_mgr.cooldown_remaining()}s | "
+                          f"Score: {signal.score}/{adj_min}{extra}")
+                else:
+                    print(f"\n  En attente... Score: {signal.score}/{adj_min} requis{extra}")
 
             time.sleep(LOOP_INTERVAL)
 
     except KeyboardInterrupt:
         logger.info("=== BOT ARRETE PAR L'UTILISATEUR ===")
         mt5.shutdown()
-        print("\nBot arrete proprement.")
+        print(f"\nBot arrete. Session: {risk_mgr.trade_count} trades, "
+              f"profit: {risk_mgr.total_profit:+.2f}$")
     except Exception as e:
         logger.error(f"ERREUR FATALE: {e}")
         mt5.shutdown()
