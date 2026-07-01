@@ -32,10 +32,13 @@ TIMEFRAME = mt5.TIMEFRAME_M5
 HIST_BOUGIES = 2016     # 7 jours
 LOOP_INTERVAL = 2       # secondes
 LOG_FILE = os.path.join(SCRIPT_DIR, "bot_expert.log")
-SCORE_MIN_ENTRY = 55    # Seuil minimum pour entrer
-SCORE_AGGRESSIVE = 80   # Seuil mode agressif
-MAX_POSITIONS = 1       # 1 seul trade a la fois
-STOP_LOSS_MAX = 15      # Perte max en $ (stop fixe -15$)
+SCORE_MIN_ENTRY = 120   # Score minimum 1er trade (tres haut = tres sur)
+SCORE_DCA_BONUS = 20    # 2eme trade si score >= score_1er + ce bonus
+SCORE_AGGRESSIVE = 140  # Seuil mode agressif (combo extreme)
+WARMUP_LOOPS = 15       # Attendre 15 boucles (~30s) observer le marche avant de trader
+MAX_POSITIONS = 2       # Max 2 trades (DCA)
+STOP_LOSS_MAX = 15      # Perte max en $ PAR TRADE (stop fixe -15$)
+STOP_LOSS_TOTAL = 20    # Perte max TOTALE pour les 2 trades combines
 COOLDOWN_SECONDS = 60   # Attente apres fermeture avant re-entrer
 MAX_SPREAD_USD = 60     # Spread max acceptable (XM = ~50$, marge de securite)
 MIN_SCORE_DIFF = 15     # Difference min entre BUY et SELL score
@@ -45,6 +48,14 @@ DAILY_LOSS_LIMIT = 12        # Arret si perte totale session >= 12$
 DAILY_PROFIT_TARGET = 20     # Objectif journalier (info seulement)
 FIXED_TP_AMOUNT = 4          # TP fixe en $ tant que solde < seuil
 FIXED_TP_BALANCE_LIMIT = 200 # Au-dessus de ce solde, TP dynamique reprend
+# RSI seuils d'entree (plus precis que le score seul)
+RSI_BUY_1 = 18              # 1er trade BUY si RSI7 <= cette valeur
+RSI_BUY_DCA = 12            # DCA BUY si RSI7 <= cette valeur
+RSI_SELL_1 = 79             # 1er trade SELL si RSI7 >= cette valeur
+RSI_SELL_DCA = 87           # DCA SELL si RSI7 >= cette valeur
+# Stop Loss reel en points (envoye a MT5, visible sur le graphique)
+# Pour BTCUSD 0.05 lot : 1 point = ~0.05$, donc 15$ / 0.05 = 300 points
+SL_POINTS = 300             # Stop Loss en points (= ~15$ pour 0.05 lot)
 TIMEFRAME_CONFIRM = mt5.TIMEFRAME_M15  # Timeframe de confirmation
 TIMEFRAME_FOND = mt5.TIMEFRAME_M30     # Timeframe de fond (tendance generale)
 
@@ -1110,11 +1121,23 @@ class RiskManager:
         self.session_stopped = False # Session arretee (limite pertes)
         self.last_signal_dir = ""   # Derniere direction signalee
         self.signal_confirm_count = 0  # Compteur confirmation
+        # DCA
+        self.first_trade_score = 0  # Score du 1er trade
+        self.first_trade_dir = ""   # Direction du 1er trade
+        self.dca_active = False     # 2eme trade ouvert (mode DCA)
 
-    def on_new_trade(self, signal: Signal):
+    def on_new_trade(self, signal: Signal, is_dca=False):
         """Appele quand un nouveau trade est ouvert"""
         self.entry_score = signal.score
         self.max_profit_seen = 0
+        if not is_dca:
+            # Premier trade
+            self.first_trade_score = signal.score
+            self.first_trade_dir = signal.direction
+            self.dca_active = False
+        else:
+            # Deuxieme trade (renforcement)
+            self.dca_active = True
 
     def on_trade_closed(self, profit: float):
         """Appele quand un trade est ferme - historique"""
@@ -1180,15 +1203,23 @@ class RiskManager:
         elapsed = time.time() - self.last_close_time
         return elapsed < COOLDOWN_SECONDS
 
-    def can_enter(self, signal: Signal) -> Tuple[bool, str]:
+    def can_enter(self, signal: Signal, snap) -> Tuple[bool, str]:
         """
-        Entree directe des que le score depasse le seuil adaptatif.
-        BTC M5 bouge trop vite pour attendre un pic.
+        Entree UNIQUEMENT si:
+        - Score >= seuil adaptatif
+        - RSI dans la zone extreme (BUY <= 18, SELL >= 79)
         """
         score_min = self.get_adjusted_score_min()
         if signal.direction == "NONE" or signal.score < score_min:
             return False, f"Score {signal.score} < seuil {score_min}"
-        return True, f"Score {signal.score} >= seuil {score_min}, ENTREE DIRECTE"
+
+        # Verifier RSI extreme
+        if signal.direction == "BUY" and snap.rsi_7 > RSI_BUY_1:
+            return False, f"RSI {snap.rsi_7:.1f} > {RSI_BUY_1} (pas assez bas pour BUY)"
+        if signal.direction == "SELL" and snap.rsi_7 < RSI_SELL_1:
+            return False, f"RSI {snap.rsi_7:.1f} < {RSI_SELL_1} (pas assez haut pour SELL)"
+
+        return True, f"Score {signal.score} + RSI {snap.rsi_7:.1f} EXTREME, ENTREE!"
 
     def cooldown_remaining(self) -> int:
         """Secondes restantes de cooldown"""
@@ -1202,137 +1233,74 @@ class RiskManager:
         """Lot fixe 0.05"""
         return LOT
 
-    def should_close(self, pos, snap: MarketSnapshot) -> Tuple[bool, str]:
+    def should_close_all(self, positions, snap: MarketSnapshot) -> Tuple[bool, str]:
         """
-        Fermeture selon force du signal d'entree :
-        - Faible (55-69)  : TP rapide 1-5$
-        - Fort (70-84)    : Laisser courir 10-15$
-        - Agressif (85+)  : Viser 25-30$
+        Gestion DCA : verifie le profit TOTAL de toutes les positions.
+        - Si perte totale >= stop : ferme tout
+        - Si RSI change de sens avec profit > 0 : ferme tout (laisser courir)
+        - Break-even si retombe a 0 apres avoir vu du profit
         """
-        profit = pos.profit
+        total_profit = sum(p.profit for p in positions)
+        nb_pos = len(positions)
 
-        # Mise a jour profit max
-        if profit > self.max_profit_seen:
-            self.max_profit_seen = profit
+        # Mise a jour profit max (total)
+        if total_profit > self.max_profit_seen:
+            self.max_profit_seen = total_profit
 
-        # === STOP LOSS (toujours actif) ===
-        if profit <= -STOP_LOSS_MAX:
-            return True, f"STOP protection solde ({profit:.2f}$ / max -{STOP_LOSS_MAX}$)"
+        # === STOP LOSS TOTAL ===
+        if nb_pos >= 2 and total_profit <= -STOP_LOSS_TOTAL:
+            return True, f"STOP TOTAL DCA: {total_profit:.2f}$ (max -{STOP_LOSS_TOTAL}$)"
+        if nb_pos == 1 and total_profit <= -STOP_LOSS_MAX:
+            return True, f"STOP: {total_profit:.2f}$ (max -{STOP_LOSS_MAX}$)"
 
-        atr_stop = snap.atr * 1.5
-        estimated_loss = min(atr_stop * LOT * 10, STOP_LOSS_MAX)
-        if profit <= -estimated_loss:
-            return True, f"Stop ATR ({profit:.2f}$ <= -{estimated_loss:.2f}$)"
+        # === BREAK-EVEN : vu +2$ total, retombe a 0 ===
+        if self.max_profit_seen >= 2 and total_profit <= 0:
+            return True, f"Break-even: max vu +{self.max_profit_seen:.2f}$, retombe a {total_profit:.2f}$"
 
-        # === BREAK-EVEN : deplacer stop a 0 des +2$ ===
-        # Si on a vu +2$ et qu'on retombe a 0 ou negatif, fermer
-        if self.max_profit_seen >= 2 and profit <= 0:
-            return True, f"Break-even: max vu +{self.max_profit_seen:.2f}$, retombe a {profit:.2f}$"
-
-        # === TP FIXE 4$ tant que solde < 200$ (construction du capital) ===
-        account = mt5.account_info()
-        if account and account.balance < FIXED_TP_BALANCE_LIMIT:
-            if profit >= FIXED_TP_AMOUNT:
-                return True, f"TP FIXE {FIXED_TP_AMOUNT}$: +{profit:.2f}$ (solde {account.balance:.0f}$ < {FIXED_TP_BALANCE_LIMIT}$)"
-
-        # === TAKE PROFIT dynamique (solde >= 200$) ===
-        if self.entry_score >= SCORE_AGGRESSIVE:
-            return self._tp_aggressive(pos, snap, profit)
-        elif self.entry_score >= 70:
-            return self._tp_strong(pos, snap, profit)
-        else:
-            return self._tp_safe(pos, snap, profit)
-
-    def _tp_safe(self, pos, snap, profit) -> Tuple[bool, str]:
-        """Signal faible (55-69) -> TP rapide 1-5$"""
-        if pos.type == 0:  # BUY
-            if snap.rsi_7 >= 55 and profit >= 1.5:
-                return True, f"TP safe BUY: RSI={snap.rsi_7:.1f}, +{profit:.2f}$"
-            if snap.rsi_7 >= 70 and profit >= 0.5:
-                return True, f"TP safe rapide: RSI={snap.rsi_7:.1f}"
-        elif pos.type == 1:  # SELL
-            if snap.rsi_7 <= 45 and profit >= 1.5:
-                return True, f"TP safe SELL: RSI={snap.rsi_7:.1f}, +{profit:.2f}$"
-            if snap.rsi_7 <= 30 and profit >= 0.5:
-                return True, f"TP safe rapide: RSI={snap.rsi_7:.1f}"
-
-        # MACD retourne
-        if pos.type == 0 and snap.macd_hist < 0 and snap.macd_hist_prev >= 0 and profit >= 1:
-            return True, f"TP safe MACD: +{profit:.2f}$"
-        if pos.type == 1 and snap.macd_hist > 0 and snap.macd_hist_prev <= 0 and profit >= 1:
-            return True, f"TP safe MACD: +{profit:.2f}$"
-
-        # Trailing a 3$
-        if profit >= 3 and 40 <= snap.rsi_7 <= 60:
-            return True, f"Trailing safe: +{profit:.2f}$ + RSI neutre"
-
-        # Max safe = 5$
-        if profit >= 5:
-            return True, f"TP safe MAX: +{profit:.2f}$"
+        # === RSI change de sens = le mouvement est fini, securiser le profit ===
+        if total_profit > 0:
+            if self.first_trade_dir == "BUY" and snap.rsi_7 >= 60:
+                return True, f"RSI securise BUY: RSI={snap.rsi_7:.0f}>=60, profit +{total_profit:.2f}$"
+            if self.first_trade_dir == "SELL" and snap.rsi_7 <= 40:
+                return True, f"RSI securise SELL: RSI={snap.rsi_7:.0f}<=40, profit +{total_profit:.2f}$"
 
         return False, ""
 
-    def _tp_strong(self, pos, snap, profit) -> Tuple[bool, str]:
-        """Signal fort (70-84) -> Viser 10-15$"""
-        if pos.type == 0:  # BUY
-            if snap.rsi_7 >= 75 and profit >= 5:
-                return True, f"TP fort BUY: RSI={snap.rsi_7:.1f}, +{profit:.2f}$"
-            if snap.rsi_7 >= 80 and profit >= 2:
-                return True, f"TP fort sature: RSI={snap.rsi_7:.1f}"
-        elif pos.type == 1:  # SELL
-            if snap.rsi_7 <= 25 and profit >= 5:
-                return True, f"TP fort SELL: RSI={snap.rsi_7:.1f}, +{profit:.2f}$"
-            if snap.rsi_7 <= 20 and profit >= 2:
-                return True, f"TP fort sature: RSI={snap.rsi_7:.1f}"
+    def can_open_dca(self, signal: Signal, positions, snap) -> Tuple[bool, str]:
+        """
+        Verifie si on peut ouvrir le 2eme trade (DCA).
+        Conditions:
+        - 1 position deja ouverte, en perte
+        - Meme direction que le 1er trade
+        - Score actuel >= score du 1er + SCORE_DCA_BONUS
+        - RSI encore plus extreme (BUY <= 12, SELL >= 87)
+        """
+        if len(positions) != 1:
+            return False, ""
+        if self.dca_active:
+            return False, "DCA deja actif"
 
-        # MACD retourne
-        if pos.type == 0 and snap.macd_hist < 0 and snap.macd_hist_prev >= 0 and profit >= 3:
-            return True, f"TP fort MACD: +{profit:.2f}$"
-        if pos.type == 1 and snap.macd_hist > 0 and snap.macd_hist_prev <= 0 and profit >= 3:
-            return True, f"TP fort MACD: +{profit:.2f}$"
+        pos = positions[0]
+        # Le 1er trade doit etre en perte
+        if pos.profit >= 0:
+            return False, "Position en profit, pas besoin de DCA"
 
-        # Trailing : profit recule de 40% depuis le max
-        if self.max_profit_seen >= 5 and profit <= self.max_profit_seen * 0.6:
-            return True, f"Trailing fort: max={self.max_profit_seen:.2f}$, actuel=+{profit:.2f}$"
+        # Meme direction
+        if signal.direction != self.first_trade_dir:
+            return False, f"Direction differente ({signal.direction} vs {self.first_trade_dir})"
 
-        # Ne jamais laisser +8$ devenir 0
-        if self.max_profit_seen >= 8 and profit <= 2:
-            return True, f"Protection: max {self.max_profit_seen:.2f}$ actuel +{profit:.2f}$"
+        # Score doit etre superieur au 1er trade + bonus
+        seuil_dca = self.first_trade_score + SCORE_DCA_BONUS
+        if signal.score < seuil_dca:
+            return False, f"Score {signal.score} < {seuil_dca} (1er={self.first_trade_score}+{SCORE_DCA_BONUS})"
 
-        # Max fort = 15$
-        if profit >= 15:
-            return True, f"TP fort MAX: +{profit:.2f}$"
+        # RSI doit etre ENCORE PLUS extreme
+        if signal.direction == "BUY" and snap.rsi_7 > RSI_BUY_DCA:
+            return False, f"RSI {snap.rsi_7:.1f} > {RSI_BUY_DCA} (pas assez bas pour DCA BUY)"
+        if signal.direction == "SELL" and snap.rsi_7 < RSI_SELL_DCA:
+            return False, f"RSI {snap.rsi_7:.1f} < {RSI_SELL_DCA} (pas assez haut pour DCA SELL)"
 
-        return False, ""
-
-    def _tp_aggressive(self, pos, snap, profit) -> Tuple[bool, str]:
-        """Signal agressif (85+) -> Viser 25-30$"""
-        if pos.type == 0:  # BUY
-            if snap.rsi_7 >= 85 and profit >= 10:
-                return True, f"TP agressif BUY: RSI={snap.rsi_7:.1f}, +{profit:.2f}$"
-        elif pos.type == 1:  # SELL
-            if snap.rsi_7 <= 15 and profit >= 10:
-                return True, f"TP agressif SELL: RSI={snap.rsi_7:.1f}, +{profit:.2f}$"
-
-        # MACD retourne (seulement gros profit)
-        if pos.type == 0 and snap.macd_hist < 0 and snap.macd_hist_prev >= 0 and profit >= 8:
-            return True, f"TP agressif MACD: +{profit:.2f}$"
-        if pos.type == 1 and snap.macd_hist > 0 and snap.macd_hist_prev <= 0 and profit >= 8:
-            return True, f"TP agressif MACD: +{profit:.2f}$"
-
-        # Trailing serre : profit recule de 30% depuis le max
-        if self.max_profit_seen >= 10 and profit <= self.max_profit_seen * 0.7:
-            return True, f"Trailing agressif: max={self.max_profit_seen:.2f}$, actuel=+{profit:.2f}$"
-
-        # Ne jamais laisser +15$ devenir 0
-        if self.max_profit_seen >= 15 and profit <= 5:
-            return True, f"Protection agressif: max {self.max_profit_seen:.2f}$"
-
-        # Max agressif = 30$
-        if profit >= 30:
-            return True, f"TP agressif MAX: +{profit:.2f}$"
-
-        return False, ""
+        return True, f"DCA OK: score {signal.score} + RSI {snap.rsi_7:.1f} EXTREME, 1er a {pos.profit:.2f}$"
 
 
 # ==============================================================
@@ -1386,13 +1354,21 @@ class OrderExecutor:
             logger.info(f"Symbol filling_mode: {info.filling_mode}")
 
     def _build_request(self, order_type, volume, price, position_ticket=None):
-        """Construit la requete EXACTEMENT comme le script initial"""
+        """Construit la requete avec SL reel visible sur MT5"""
+        # Calculer le SL
+        point = mt5.symbol_info(SYMBOL).point if mt5.symbol_info(SYMBOL) else 1.0
+        if order_type == mt5.ORDER_TYPE_BUY:
+            sl = price - SL_POINTS * point
+        else:
+            sl = price + SL_POINTS * point
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": SYMBOL,
             "volume": volume,
             "type": order_type,
             "price": price,
+            "sl": sl,
             "deviation": 20,
             "magic": MAGIC_NUMBER
         }
@@ -1574,29 +1550,24 @@ class Dashboard:
 
         # Position en cours + details temps reel
         if positions:
-            pos = positions[0]
-            pos_type = "BUY" if pos.type == 0 else "SELL"
-            profit_sign = "+" if pos.profit >= 0 else ""
-            duration = ""
-            try:
-                open_time = datetime.fromtimestamp(pos.time)
-                elapsed = datetime.now() - open_time
-                minutes = int(elapsed.total_seconds() // 60)
-                seconds = int(elapsed.total_seconds() % 60)
-                duration = f" | Duree: {minutes}m{seconds:02d}s"
-            except:
-                pass
-            print(f"  POSITION: {pos_type} | Lot: {pos.volume}")
-            print(f"  Prix ouv: {pos.price_open:.2f} | Prix act: {snap.prix:.2f}")
-            print(f"  Profit  : {profit_sign}{pos.profit:.2f}${duration}")
-            # Afficher trailing info
+            total_profit = sum(p.profit for p in positions)
+            print(f"  POSITIONS: {len(positions)}/{MAX_POSITIONS} | Profit total: {total_profit:+.2f}$")
+            for i, pos in enumerate(positions):
+                pos_type = "BUY" if pos.type == 0 else "SELL"
+                profit_sign = "+" if pos.profit >= 0 else ""
+                duration = ""
+                try:
+                    open_time = datetime.fromtimestamp(pos.time)
+                    elapsed = datetime.now() - open_time
+                    minutes = int(elapsed.total_seconds() // 60)
+                    seconds = int(elapsed.total_seconds() % 60)
+                    duration = f" | {minutes}m{seconds:02d}s"
+                except:
+                    pass
+                label = "1er" if i == 0 else "DCA"
+                print(f"    [{label}] {pos_type} | Ouv: {pos.price_open:.2f} | P/L: {profit_sign}{pos.profit:.2f}${duration}")
             if risk_mgr and risk_mgr.max_profit_seen > 0:
-                mode_tp = "SAFE 1-5$"
-                if risk_mgr.entry_score >= SCORE_AGGRESSIVE:
-                    mode_tp = "AGRESSIF 25-30$"
-                elif risk_mgr.entry_score >= 70:
-                    mode_tp = "FORT 10-15$"
-                print(f"  Max vu  : +{risk_mgr.max_profit_seen:.2f}$ | Mode TP: {mode_tp}")
+                print(f"  Max vu  : +{risk_mgr.max_profit_seen:.2f}$ | TP a +{FIXED_TP_AMOUNT}$ total")
         else:
             print("  Aucune position ouverte")
 
@@ -1748,8 +1719,12 @@ def main():
     print(f"  Compte  : {account_info.login} ({account_info.server})")
     print(f"  Solde   : {account_info.balance:.2f}$")
     print(f"  Symbole : {SYMBOL}")
-    print(f"  Lot     : {LOT}")
-    print(f"  Stop max: -{STOP_LOSS_MAX}$")
+    print(f"  Lot     : {LOT} x {MAX_POSITIONS} max (DCA)")
+    print(f"  Score   : 1er >= {SCORE_MIN_ENTRY} | DCA >= 1er + {SCORE_DCA_BONUS}")
+    print(f"  RSI BUY : 1er <= {RSI_BUY_1} | DCA <= {RSI_BUY_DCA}")
+    print(f"  RSI SELL: 1er >= {RSI_SELL_1} | DCA >= {RSI_SELL_DCA}")
+    print(f"  Stop    : -{STOP_LOSS_MAX}$/trade | -{STOP_LOSS_TOTAL}$ total (SL sur MT5)")
+    print(f"  TP      : +{FIXED_TP_AMOUNT}$ total (sortie profit)")
     print(f"  Boucle  : {LOOP_INTERVAL}s")
     print("-" * 58)
     print()
@@ -1763,6 +1738,7 @@ def main():
 
     filling_names = {0: "FOK", 1: "IOC", 2: "RETURN", None: "AUTO (comme script initial)"}
     print(f"  Filling : {filling_names.get(executor.filling_type, executor.filling_type)}")
+    print(f"  Seuil   : {SCORE_MIN_ENTRY} (warmup {WARMUP_LOOPS} boucles avant trading)")
 
     # Check initial du fichier historique
     hist_ok, hist_msg = validator.validate_trade_history()
@@ -1770,6 +1746,48 @@ def main():
     print(f"  Historique: {hist_msg}")
 
     logger.info("=== BOT EXPERT V3 DEMARRE - 64 Scenarios ===")
+
+    # === CHECK SECURITE RELANCE ===
+    # Verifier s'il y a deja des positions ouvertes (script a pu crasher)
+    existing_positions = mt5.positions_get(symbol=SYMBOL)
+    if existing_positions and len(existing_positions) > 0:
+        total_pl = sum(p.profit for p in existing_positions)
+        nb_exist = len(existing_positions)
+        print(f"\n  !!! ATTENTION: {nb_exist} position(s) DEJA ouvertes !!!")
+        for p in existing_positions:
+            ptype = "BUY" if p.type == 0 else "SELL"
+            print(f"      {ptype} | Ouv: {p.price_open:.2f} | P/L: {p.profit:+.2f}$")
+        print(f"      Profit total: {total_pl:+.2f}$")
+        print(f"\n  Le bot va GERER ces positions (pas en ouvrir de nouvelles)")
+        print(f"  Il appliquera les regles de sortie (RSI/Stop/Break-even)")
+        # Marquer le DCA si 2 positions
+        if nb_exist >= 2:
+            risk_mgr.dca_active = True
+        # Detecter la direction
+        risk_mgr.first_trade_dir = "BUY" if existing_positions[0].type == 0 else "SELL"
+        risk_mgr.first_trade_score = SCORE_MIN_ENTRY  # On ne connait pas le score initial
+        logger.info(f"RELANCE: {nb_exist} positions existantes, P/L={total_pl:.2f}$")
+    else:
+        print("\n  Aucune position existante. Observation avant trading.")
+
+    # Verifier les pertes recentes dans l'historique
+    if os.path.exists(TRADE_HISTORY_FILE):
+        try:
+            df_hist = pd.read_csv(TRADE_HISTORY_FILE)
+            if len(df_hist) >= 2:
+                recent = df_hist.tail(3)
+                recent_losses = sum(1 for _, r in recent.iterrows() if r['profit'] < 0)
+                if recent_losses >= 2:
+                    risk_mgr.consecutive_losses = recent_losses
+                    new_seuil = risk_mgr.get_adjusted_score_min()
+                    print(f"\n  !!! {recent_losses} pertes recentes detectees dans l'historique")
+                    print(f"      Seuil adaptatif augmente: {new_seuil} (au lieu de {SCORE_MIN_ENTRY})")
+                    logger.info(f"RELANCE: {recent_losses} pertes recentes, seuil={new_seuil}")
+        except:
+            pass
+
+    print(f"\n  WARMUP: {WARMUP_LOOPS} boucles ({WARMUP_LOOPS * LOOP_INTERVAL}s) d'observation")
+    print("  Le bot ne fera AUCUN trade pendant cette periode.")
     print("\n  TOUS LES CHECKS OK - Bot demarre !")
     print("  (Ctrl+C pour arreter)")
     print()
@@ -1832,40 +1850,69 @@ def main():
                       f"Profit: {risk_mgr.total_profit:+.2f}$ | "
                       f"Winrate: {winrate:.0f}%")
 
-            # --- Gestion position existante ---
+            # --- Gestion positions existantes (DCA) ---
             if positions:
-                pos = positions[0]
-                should_close, reason = risk_mgr.should_close(pos, snap)
+                # Verifier si on doit fermer TOUTES les positions
+                should_close, reason = risk_mgr.should_close_all(positions, snap)
                 if should_close:
-                    profit_before = pos.profit
-                    executor.close_position(pos, reason)
-                    risk_mgr.on_trade_closed(profit_before)
-                    logger.info(f"FERMETURE: {reason}")
+                    total_profit = sum(p.profit for p in positions)
+                    for pos in positions:
+                        executor.close_position(pos, reason)
+                    risk_mgr.on_trade_closed(total_profit)
+                    risk_mgr.dca_active = False
+                    risk_mgr.first_trade_score = 0
+                    risk_mgr.first_trade_dir = ""
+                    logger.info(f"FERMETURE TOTALE ({len(positions)} pos): {reason} | Profit={total_profit:.2f}$")
 
-            # --- Ouverture nouvelle position (1 seul trade) ---
+                # Sinon, verifier si on peut ouvrir le 2eme trade (DCA)
+                elif signal.direction != "NONE" and len(positions) < MAX_POSITIONS:
+                    can_dca, dca_msg = risk_mgr.can_open_dca(signal, positions, snap)
+                    if can_dca:
+                        # Verifier spread avant DCA
+                        spread_ok, spread_val = check_spread()
+                        if spread_ok:
+                            lot = LOT
+                            success = executor.open_order(signal.direction, lot)
+                            if success:
+                                risk_mgr.on_new_trade(signal, is_dca=True)
+                                print(f"  >>> DCA OUVERT: {signal.direction} | Score={signal.score}")
+                                logger.info(f"DCA {signal.direction} | Score={signal.score}")
+                    else:
+                        # Afficher info DCA en attente
+                        total_profit = sum(p.profit for p in positions)
+                        seuil_dca = risk_mgr.first_trade_score + SCORE_DCA_BONUS
+                        if len(positions) == 1 and positions[0].profit < 0:
+                            print(f"\n  DCA ATTENTE: score {signal.score}/{seuil_dca} requis")
+                        print(f"  PROFIT TOTAL: {total_profit:+.2f}$ ({len(positions)} pos)")
+
+            # --- Ouverture premiere position ---
             elif signal.direction != "NONE":
-                # Check 0: Session arretee
-                if risk_mgr.session_stopped:
+                # Check 0: Warmup (observer le marche avant de trader)
+                if loop_count <= WARMUP_LOOPS:
+                    print(f"\n  WARMUP: observation {loop_count}/{WARMUP_LOOPS} (pas de trade)")
+
+                # Check 1: Session arretee
+                elif risk_mgr.session_stopped:
                     print(f"\n  SESSION ARRETEE: perte limite {DAILY_LOSS_LIMIT}$ atteinte")
 
-                # Check 1: Cooldown
+                # Check 2: Cooldown
                 elif risk_mgr.is_cooldown_active():
                     remaining = risk_mgr.cooldown_remaining()
                     print(f"\n  COOLDOWN: {remaining}s restantes")
 
-                # Check 2: Spread
+                # Check 3: Spread
                 elif not check_spread()[0]:
                     _, spread = check_spread()
                     print(f"\n  SPREAD TROP LARGE: {spread:.0f}$ > max {MAX_SPREAD_USD}$")
 
-                # Check 3: Confirmation (apres pertes)
+                # Check 4: Confirmation (apres pertes)
                 elif risk_mgr.needs_confirmation(signal):
                     print(f"\n  CONFIRMATION: signal {signal.direction} vu "
                           f"{risk_mgr.signal_confirm_count}/2 fois (apres pertes)")
 
-                # Check 4: Entree directe (BTC M5 = pas le temps d'attendre)
+                # Check 5: Entree (Score + RSI extreme)
                 else:
-                    can_enter, entry_msg = risk_mgr.can_enter(signal)
+                    can_enter, entry_msg = risk_mgr.can_enter(signal, snap)
                     print(f"\n  ENTRY: {entry_msg}")
 
                     if can_enter:
@@ -1874,9 +1921,9 @@ def main():
                         if success:
                             risk_mgr.on_new_trade(signal)
                             risk_mgr.signal_confirm_count = 0
-                            print(f"  >>> TRADE OUVERT: {signal.direction} | Lot={lot} | Score={signal.score}")
+                            print(f"  >>> TRADE OUVERT: {signal.direction} | Lot={lot} | Score={signal.score} | RSI={snap.rsi_7:.1f}")
                             logger.info(
-                                f"OUVERTURE {signal.direction} | Score={signal.score} | "
+                                f"OUVERTURE {signal.direction} | Score={signal.score} | RSI={snap.rsi_7:.1f} | "
                                 f"Scenarios={signal.scenario_count} | Lot={lot} | "
                                 f"Raisons: {'; '.join(signal.reasons[:5])}"
                             )
@@ -1888,11 +1935,12 @@ def main():
                 extra = ""
                 if risk_mgr.consecutive_losses >= 2:
                     extra = f" (seuil +{adj_min - SCORE_MIN_ENTRY} apres {risk_mgr.consecutive_losses} pertes)"
+                rsi_info = f" | RSI={snap.rsi_7:.1f} (BUY<={RSI_BUY_1} SELL>={RSI_SELL_1})"
                 if risk_mgr.is_cooldown_active():
                     print(f"\n  COOLDOWN: {risk_mgr.cooldown_remaining()}s | "
                           f"Score: {signal.score}/{adj_min}{extra}")
                 else:
-                    print(f"\n  En attente... Score: {signal.score}/{adj_min} requis{extra}")
+                    print(f"\n  En attente... Score: {signal.score}/{adj_min}{rsi_info}{extra}")
 
             time.sleep(LOOP_INTERVAL)
 
