@@ -25,28 +25,40 @@ SCRIPT_DIR = os.path.join(os.path.expanduser("~"), "BotTrading")
 os.makedirs(SCRIPT_DIR, exist_ok=True)
 
 SYMBOL = "BTCUSD"
-LOT_BASE = 0.05             # Lot de base (pour 100$ de solde)
+LOT_BASE = 0.05             # Lot fixe
 LOT_PER_100 = 0.05          # Augmenter de 0.05 par tranche de 100$
 LOT_MAX = 0.50              # Lot maximum (securite)
 RISK_PERCENT = 12           # Risque max en % du solde par trade
 MAGIC_NUMBER = 123456
-TIMEFRAME = mt5.TIMEFRAME_M15
-HIST_BOUGIES = 2016     # ~21 jours en M15
-LOOP_INTERVAL = 5       # secondes (M15 = moins urgent)
+TIMEFRAME = mt5.TIMEFRAME_M1
+HIST_BOUGIES = 500      # ~8h en M1
+LOOP_INTERVAL = 2       # secondes (scalper = rapide!)
 LOG_FILE = os.path.join(SCRIPT_DIR, "bot_expert.log")
-SCORE_MIN_ENTRY = 90    # Score minimum (optimise backtest juin: +442$)
+SCORE_MIN_ENTRY = 55    # Score bas = plus de trades (scalp)
 SCORE_DCA_MIN = 200     # Score minimum 2eme trade (DCA = tres sur)
-SCORE_AGGRESSIVE = 150  # Seuil mode agressif (combo extreme)
-WARMUP_LOOPS = 10       # Attendre 10 boucles (~50s) observer le marche avant de trader
-MAX_POSITIONS = 1       # 1 SEUL trade toujours (securite maximale)
-STOP_LOSS_MAX = 12      # Stop pour signaux BREAKOUT (rapide = stop serre)
-STOP_LOSS_EXT = 20      # Stop pour signaux EXTREME RSI (besoin d'espace)
-COOLDOWN_SECONDS = 60   # Attente apres fermeture avant re-entrer
-COOLDOWN_AFTER_LOSS = 180  # Cooldown renforce apres 2+ pertes consecutives
-MAX_SPREAD_USD = 60     # Spread max acceptable (XM = ~50$, marge de securite)
-MIN_SCORE_DIFF = 15     # Difference min entre BUY et SELL score
+SCORE_AGGRESSIVE = 150  # Seuil mode agressif
+WARMUP_LOOPS = 5        # 5 boucles (~10s) warmup
+MAX_POSITIONS = 1       # 1 SEUL trade
+STOP_LOSS_MAX = 5       # STOP reel: 5$ (donne 2.5$ de marge APRES spread de 2.5$)
+STOP_LOSS_EXT = 5       # Meme stop pour tous les types
+# --- SCALPER V2 TREND-FOLLOWING CONFIG (AJUSTE POUR SPREAD XM) ---
+# SPREAD XM BTCUSD ~ 50 points = 2.5$ de cout par trade a 0.05 lot
+# Tous les seuils sont APRES spread (pos.profit inclut deja le spread)
+SCALP_TP = 4.0          # Take Profit: 4$ (= 1.5$ net apres 2.5$ spread)
+SCALP_TRAIL_START = 1.5   # Trailing: demarre a +1.5$ (spread recupere + profit)
+SCALP_TRAIL_DIST = 1.0    # Trailing: 1$ derriere le max profit
+SCALP_MAX_HOLD = 300    # Max 5 minutes (targets plus grands = plus de temps)
+SCALP_BREAKEVEN = 0.50  # Breakeven a +0.50$ (proteger si on repasse a 0 apres spread)
+SCALP_TREND_REV_DELAY = 30  # Secondes min avant d'activer trend reversal exit
+COOLDOWN_SECONDS = 10   # 10s cooldown
+COOLDOWN_AFTER_LOSS = 30   # 30s apres perte
+MAX_SPREAD_USD = 30     # Spread max: 30$ (= 1.5$ de cout, acceptable)
+MIN_SCORE_DIFF = 10     # Diff min BUY vs SELL (scalp = plus souple)
 TRADE_HISTORY_FILE = os.path.join(SCRIPT_DIR, "trades_history.csv")
 MAX_CONSECUTIVE_LOSSES = 3   # Apres 3 pertes d'affilee, augmenter le seuil
+PAUSE_AFTER_LOSSES = 2       # Apres 2 pertes consecutives, PAUSE
+PAUSE_DURATION = 4 * 3600    # Duree de la pause: 4 heures (en secondes)
+PAUSE_OVERRIDE_SCORE = 150   # Score >= 150 = signal EXCEPTIONNEL, ignore la pause
 DAILY_LOSS_LIMIT = 10        # Arret si perte totale session >= 10$ (proteger capital)
 DAILY_PROFIT_TARGET = 20     # Objectif journalier (info seulement)
 # RSI seuils d'entree (optimise juin: +442$ avec breakouts)
@@ -1141,6 +1153,9 @@ class RiskManager:
         # Signal type tracking
         self.signal_type = "BRK"        # "BRK" ou "EXT"
         self._pending_signal_type = "BRK"
+        # PAUSE 4H apres 2 pertes consecutives
+        self.pause_until = 0            # timestamp de fin de pause (0 = pas en pause)
+        self.pause_triggered = False     # True si pause en cours
 
     def on_new_trade(self, signal: Signal, is_dca=False, signal_type="EXT"):
         """Appele quand un nouveau trade est ouvert"""
@@ -1165,12 +1180,22 @@ class RiskManager:
             self.win_count += 1
             self.consecutive_losses = 0
             self.waiting_rsi_reset = False
+            self.pause_triggered = False  # Reset pause si on gagne
         else:
             self.consecutive_losses += 1
             if was_stop:
                 self.waiting_rsi_reset = True
                 self.rsi_was_neutral = False
                 logger.info("POST-SL: attente RSI zone neutre avant prochain trade")
+            # === PAUSE 4H APRES 2 PERTES CONSECUTIVES ===
+            if self.consecutive_losses >= PAUSE_AFTER_LOSSES:
+                self.pause_until = time.time() + PAUSE_DURATION
+                self.pause_triggered = True
+                pause_end = datetime.fromtimestamp(self.pause_until).strftime('%H:%M:%S')
+                logger.warning(f"PAUSE 4H ACTIVEE: {self.consecutive_losses} pertes consecutives. Reprise a {pause_end}")
+                print(f"\n  !!! PAUSE 4H ACTIVEE: {self.consecutive_losses} pertes consecutives !!!")
+                print(f"      Pas de trading avant {pause_end}")
+                print(f"      Protege le capital contre les mauvaises conditions")
 
         if self.total_profit <= -DAILY_LOSS_LIMIT:
             self.session_stopped = True
@@ -1212,16 +1237,29 @@ class RiskManager:
         return SCORE_MIN_ENTRY
 
     def needs_confirmation(self, signal: Signal) -> bool:
-        """Apres pertes, exiger 2 lectures consecutives"""
-        if self.consecutive_losses < 2:
-            self.last_signal_dir = signal.direction
-            return False
-        if signal.direction == self.last_signal_dir:
-            self.signal_confirm_count += 1
-        else:
-            self.signal_confirm_count = 0
-            self.last_signal_dir = signal.direction
-        return self.signal_confirm_count < 2
+        """SCALP: pas besoin de confirmation, entrer vite"""
+        return False
+
+    def is_pause_active(self, signal_score: int = 0) -> Tuple[bool, str]:
+        """True si la pause de 4h apres 2 pertes consecutives est active.
+        Exception: score >= PAUSE_OVERRIDE_SCORE = opportunite rare, on passe!"""
+        if not self.pause_triggered or self.pause_until == 0:
+            return False, ""
+        remaining = self.pause_until - time.time()
+        if remaining <= 0:
+            # Pause terminee
+            self.pause_triggered = False
+            self.pause_until = 0
+            logger.info("PAUSE 4H TERMINEE: trading autorise")
+            return False, ""
+        # === EXCEPTION: SIGNAL EXCEPTIONNEL (score >= 150) ===
+        if signal_score >= PAUSE_OVERRIDE_SCORE:
+            logger.info(f"PAUSE BYPASS: score {signal_score} >= {PAUSE_OVERRIDE_SCORE} (opportunite rare!)")
+            return False, f"PAUSE BYPASS: score {signal_score} EXCEPTIONNEL!"
+        hours = int(remaining // 3600)
+        minutes = int((remaining % 3600) // 60)
+        resume_time = datetime.fromtimestamp(self.pause_until).strftime('%H:%M')
+        return True, f"PAUSE 4H ({self.consecutive_losses} pertes): reste {hours}h{minutes:02d}m, reprise a {resume_time}"
 
     def is_cooldown_active(self) -> bool:
         if self.last_close_time == 0:
@@ -1230,52 +1268,59 @@ class RiskManager:
         return (time.time() - self.last_close_time) < cooldown
 
     def can_enter(self, signal: Signal, snap) -> Tuple[bool, str]:
-        """Accepte 2 types: BREAKOUT (cassure de structure) ou EXTREME (RSI extreme + rollover)"""
+        """SCALPER V2 TREND-FOLLOWING: pullback dans le trend
+        - BUY: EMA9 > EMA21 (trend UP) + RSI < 50 (pullback) + RSI monte
+        - SELL: EMA9 < EMA21 (trend DOWN) + RSI > 50 (pullback) + RSI descend
+        """
         score_min = self.get_adjusted_score_min()
         if signal.direction == "NONE" or signal.score < score_min:
             return False, f"Score {signal.score} < seuil {score_min}"
 
-        # --- TYPE 1: BREAKOUT (cassure high/low 10 bougies + volume) ---
-        is_breakout = False
-        if signal.direction == "BUY" and snap.is_new_high_2h:
-            if snap.volume_ratio >= 1.2 and snap.rsi_7 <= BREAKOUT_RSI_MAX_BUY:
-                if snap.move_1b_in_atr >= 0.8:
-                    is_breakout = True
-        if signal.direction == "SELL" and snap.is_new_low_2h:
-            if snap.volume_ratio >= 1.2 and snap.rsi_7 >= BREAKOUT_RSI_MIN_SELL:
-                if snap.move_1b_in_atr >= 0.8:
-                    is_breakout = True
+        # === FILTRE TREND-FOLLOWING (CLE DE LA V2) ===
+        # Determiner le micro-trend (EMA9 vs EMA21)
+        trend_up = snap.ema_9 > snap.ema_21
+        trend_down = snap.ema_9 < snap.ema_21
+        rsi = snap.rsi_7
+        rsi_prev = snap.rsi_prev_7
 
-        if is_breakout:
-            self._pending_signal_type = "BRK"
-            return True, f"BREAKOUT {signal.direction} (vol={snap.volume_ratio:.1f}x, ATR={snap.move_1b_in_atr:.1f}x)"
+        if signal.direction == "BUY":
+            # 1. Trend doit etre UP (EMA9 > EMA21)
+            if not trend_up:
+                # Exception: RSI ultra-bas (< 25) = reversal autorise meme sans trend
+                if rsi > 25:
+                    return False, f"BLOQUE BUY: trend DOWN (EMA9<EMA21), RSI={rsi:.1f}"
+            # 2. RSI doit etre < 50 (pullback, pas deja surachete)
+            if rsi > 55:
+                return False, f"BLOQUE BUY: RSI={rsi:.1f} > 55 (pas un pullback)"
+            # 3. RSI doit monter (pullback fini, reprend le trend)
+            if rsi <= rsi_prev:
+                return False, f"BLOQUE BUY: RSI descend ({rsi_prev:.1f}->{rsi:.1f}), pullback pas fini"
+            # 4. Prix pas trop loin au-dessus de EMA9 (sinon c'est pas un pullback)
+            if snap.atr > 0:
+                dist_ema9 = (snap.prix - snap.ema_9) / snap.atr
+                if dist_ema9 > 1.5:
+                    return False, f"BLOQUE BUY: prix trop loin d'EMA9 ({dist_ema9:.1f}x ATR)"
 
-        # --- TYPE 2: EXTREME RSI (ancien systeme avec rollover) ---
-        if signal.direction == "BUY" and snap.rsi_7 > RSI_BUY_1:
-            return False, f"RSI {snap.rsi_7:.1f} > {RSI_BUY_1} (pas assez bas pour EXT)"
-        if signal.direction == "SELL" and snap.rsi_7 < RSI_SELL_1:
-            return False, f"RSI {snap.rsi_7:.1f} < {RSI_SELL_1} (pas assez haut pour EXT)"
+        elif signal.direction == "SELL":
+            # 1. Trend doit etre DOWN (EMA9 < EMA21)
+            if not trend_down:
+                # Exception: RSI ultra-haut (> 75) = reversal autorise
+                if rsi < 75:
+                    return False, f"BLOQUE SELL: trend UP (EMA9>EMA21), RSI={rsi:.1f}"
+            # 2. RSI doit etre > 50 (pullback haussier dans trend baissier)
+            if rsi < 45:
+                return False, f"BLOQUE SELL: RSI={rsi:.1f} < 45 (pas un pullback)"
+            # 3. RSI doit descendre (le pullback est fini)
+            if rsi >= rsi_prev:
+                return False, f"BLOQUE SELL: RSI monte ({rsi_prev:.1f}->{rsi:.1f}), pullback pas fini"
+            # 4. Prix pas trop loin en-dessous de EMA9
+            if snap.atr > 0:
+                dist_ema9 = (snap.ema_9 - snap.prix) / snap.atr
+                if dist_ema9 > 1.5:
+                    return False, f"BLOQUE SELL: prix trop loin d'EMA9 ({dist_ema9:.1f}x ATR)"
 
-        # ROLLOVER CONFIRMATION
-        if signal.direction == "SELL" and snap.rsi_7 < RSI_ULTRA_SELL:
-            rsi_delta = snap.rsi_prev_7 - snap.rsi_7
-            if rsi_delta < RSI_ROLLOVER_MIN:
-                return False, f"RSI SELL rollover: delta {rsi_delta:.1f} < {RSI_ROLLOVER_MIN}"
-        if signal.direction == "BUY" and snap.rsi_7 > RSI_ULTRA_BUY:
-            rsi_delta = snap.rsi_7 - snap.rsi_prev_7
-            if rsi_delta < RSI_ROLLOVER_MIN:
-                return False, f"RSI BUY rollover: delta {rsi_delta:.1f} < {RSI_ROLLOVER_MIN}"
-
-        self._pending_signal_type = "EXT"
-        return True, f"EXTREME {signal.direction} (RSI={snap.rsi_7:.1f})"
-
-        # FILTRE TENDANCE : ne pas SELL dans une forte tendance haussiere
-        if signal.direction == "SELL" and snap.trend_m15 == "UP" and snap.trend_m30 == "UP":
-            return False, f"BLOQUE SELL: M15+M30 haussiers (tendance forte contre SELL)"
-        if signal.direction == "BUY" and snap.trend_m15 == "DOWN" and snap.trend_m30 == "DOWN":
-            return False, f"BLOQUE BUY: M15+M30 baissiers (tendance forte contre BUY)"
-
-        return True, f"Score {signal.score} + RSI {snap.rsi_7:.1f} EXTREME + rollover confirme, ENTREE!"
+        self._pending_signal_type = "TREND"
+        return True, f"TREND {signal.direction} (score={signal.score}, RSI={rsi:.1f}, trend={'UP' if trend_up else 'DOWN'})"
 
     def can_open_dca(self, signal: Signal, positions, snap) -> Tuple[bool, str]:
         """2eme trade : Score >= 200 + RSI ultra-extreme"""
@@ -1332,78 +1377,74 @@ class RiskManager:
         return final_lot
 
     def should_close_all(self, positions, snap: MarketSnapshot) -> Tuple[bool, str]:
-        """Sortie INTELLIGENTE en 4 niveaux - PAS de TP fixe, le logiciel securise"""
+        """SCALPER V2 (SPREAD-AWARE): TP 4$, Trailing, Trend reversal, Stop 5$
+        Note: pos.profit inclut DEJA le cout du spread (-2.5$ a l'entree).
+        Donc TP=4$ signifie un VRAI gain de ~1.5$ apres spread.
+        Et STOP=5$ donne 2.5$ de marge REELLE apres les -2.5$ initiaux.
+        """
         total_profit = sum(p.profit for p in positions)
 
         if total_profit > self.max_profit_seen:
             self.max_profit_seen = total_profit
 
         # ============================================================
-        # NIVEAU 1 : PROTECTION ABSOLUE (stop software adaptatif)
+        # STOP : -5$ max (inclut les -2.5$ de spread initial)
+        # Le prix doit bouger de 50pts contre nous pour toucher ce stop
         # ============================================================
-        # Stop adapte au type de signal: BRK=12$ (rapide), EXT=20$ (besoin espace)
-        stop_val = STOP_LOSS_MAX if getattr(self, 'signal_type', 'BRK') == 'BRK' else STOP_LOSS_EXT
-        if total_profit <= -stop_val:
-            return True, f"STOP SOFTWARE ({getattr(self, 'signal_type', '?')}): {total_profit:.2f}$ (max -{stop_val}$)"
+        if total_profit <= -STOP_LOSS_MAX:
+            return True, f"STOP: {total_profit:.2f}$ (max -{STOP_LOSS_MAX}$)"
 
         # ============================================================
-        # NIVEAU 2 : SORTIE PERTE CONFIRMEE (RSI dit que c'est fini)
+        # TP : +4$ = prix a bouge ~130 pts en notre faveur (spread+profit)
         # ============================================================
-        # Perte > 5$ ET RSI completement retourne = le mouvement est parti
-        if total_profit < -5:
-            if self.first_trade_dir == "BUY" and snap.rsi_7 >= 60:
-                return True, f"PERTE CONFIRMEE: BUY mais RSI={snap.rsi_7:.0f}>=60 {total_profit:.2f}$"
-            if self.first_trade_dir == "SELL" and snap.rsi_7 <= 40:
-                return True, f"PERTE CONFIRMEE: SELL mais RSI={snap.rsi_7:.0f}<=40 {total_profit:.2f}$"
-
-        # En perte ET RSI rebondit vers l'extreme APRES avoir ete en profit
-        # = piege double-top/bottom (le rebond a echoue, retour vers l'extreme)
-        # Seulement si: perte > 2$ ET on a vu au moins 1$ de profit avant
-        if total_profit < -2 and self.max_profit_seen >= 1:
-            if self.first_trade_dir == "SELL" and snap.rsi_7 >= 80:
-                return True, f"PIEGE SELL: RSI={snap.rsi_7:.0f}>=80 apres +{self.max_profit_seen:.1f}$ {total_profit:.2f}$"
-            if self.first_trade_dir == "BUY" and snap.rsi_7 <= 18:
-                return True, f"PIEGE BUY: RSI={snap.rsi_7:.0f}<=18 apres +{self.max_profit_seen:.1f}$ {total_profit:.2f}$"
+        if total_profit >= SCALP_TP:
+            return True, f"TP: +{total_profit:.2f}$ >= {SCALP_TP}$ PRIS!"
 
         # ============================================================
-        # NIVEAU 3 : TRAILING PROFIT DYNAMIQUE (securiser les gains)
+        # TRAILING STOP : demarre a +1.5$ (spread recupere + debut profit)
+        # Trail 1$ derriere le max: securise les gains progressivement
         # ============================================================
-        # Paliers optimises pour laisser courir les gains :
-        #   - Max vu >= 4$ : proteger 35% (ex: max 5$ -> plancher 1.75$)
-        #   - Max vu >= 8$ : proteger 50% (ex: max 10$ -> plancher 5$)
-        #   - Max vu >= 12$ : proteger 65% (ex: max 15$ -> plancher 9.75$)
-        if self.max_profit_seen >= 12:
-            trailing_floor = self.max_profit_seen * 0.65
-            if total_profit <= trailing_floor:
-                return True, f"TRAILING 65%: max +{self.max_profit_seen:.2f}$, plancher {trailing_floor:.2f}$, actuel {total_profit:.2f}$"
-        elif self.max_profit_seen >= 8:
-            trailing_floor = self.max_profit_seen * 0.50
-            if total_profit <= trailing_floor:
-                return True, f"TRAILING 50%: max +{self.max_profit_seen:.2f}$, plancher {trailing_floor:.2f}$, actuel {total_profit:.2f}$"
-        elif self.max_profit_seen >= 4:
-            trailing_floor = self.max_profit_seen * 0.35
-            if total_profit <= trailing_floor:
-                return True, f"TRAILING 35%: max +{self.max_profit_seen:.2f}$, plancher {trailing_floor:.2f}$, actuel {total_profit:.2f}$"
+        if self.max_profit_seen >= SCALP_TRAIL_START:
+            trail_floor = self.max_profit_seen - SCALP_TRAIL_DIST
+            if total_profit <= trail_floor:
+                return True, f"TRAIL: max +{self.max_profit_seen:.2f}$, exit {total_profit:+.2f}$ (floor={trail_floor:+.2f}$)"
 
         # ============================================================
-        # NIVEAU 4 : RSI CONFIRME FIN DU MOUVEMENT (sortie propre)
+        # TREND REVERSAL : si le trend change APRES stabilisation
+        # IMPORTANT: attend SCALP_TREND_REV_DELAY secondes avant d'activer
+        # (sinon le spread + bruit initial declenche des faux signaux)
         # ============================================================
-        # On sort quand RSI revient en zone NEUTRE = le momentum est epuise
-        # MAIS seulement si profit >= 2.5$ (laisser le trade se developper)
-        if total_profit >= 2.5:
-            # BUY : RSI remonte vers 60+ = momentum epuise
-            # SELL : RSI redescend vers 40- = momentum epuise
-            if self.first_trade_dir == "BUY" and snap.rsi_7 >= 60:
-                # Si profit gros et RSI pas encore a 65, laisser courir avec trailing
-                if total_profit >= 5 and snap.rsi_7 < 65:
-                    pass  # Trailing protege, laisser courir
-                else:
-                    return True, f"RSI SECURISE BUY: RSI={snap.rsi_7:.0f}>=60, profit +{total_profit:.2f}$"
-            if self.first_trade_dir == "SELL" and snap.rsi_7 <= 40:
-                if total_profit >= 5 and snap.rsi_7 > 35:
-                    pass  # Trailing protege, laisser courir
-                else:
-                    return True, f"RSI SECURISE SELL: RSI={snap.rsi_7:.0f}<=40, profit +{total_profit:.2f}$"
+        if positions:
+            try:
+                from datetime import datetime
+                open_time = datetime.fromtimestamp(positions[0].time)
+                elapsed = (datetime.now() - open_time).total_seconds()
+
+                # Seulement activer apres le delai (laisser le spread se stabiliser)
+                if elapsed >= SCALP_TREND_REV_DELAY:
+                    pos_dir = "BUY" if positions[0].type == 0 else "SELL"
+                    if pos_dir == "BUY" and snap.ema_9 < snap.ema_21 and total_profit < 0.50:
+                        return True, f"TREND_REV: EMA9<EMA21 vs BUY ({elapsed:.0f}s), P/L={total_profit:+.2f}$"
+                    if pos_dir == "SELL" and snap.ema_9 > snap.ema_21 and total_profit < 0.50:
+                        return True, f"TREND_REV: EMA9>EMA21 vs SELL ({elapsed:.0f}s), P/L={total_profit:+.2f}$"
+            except:
+                pass
+
+        # ============================================================
+        # TIMEOUT : max 5 min (targets plus grands = plus de patience)
+        # ============================================================
+        if positions:
+            try:
+                from datetime import datetime
+                open_time = datetime.fromtimestamp(positions[0].time)
+                elapsed = (datetime.now() - open_time).total_seconds()
+                if elapsed >= SCALP_MAX_HOLD:
+                    if total_profit > 0:
+                        return True, f"TIMEOUT +profit: {elapsed:.0f}s, P/L={total_profit:+.2f}$"
+                    elif total_profit > -1.5:  # Pas trop en perte
+                        return True, f"TIMEOUT ~BE: {elapsed:.0f}s, P/L={total_profit:+.2f}$"
+            except:
+                pass
 
         return False, ""
 
@@ -1481,18 +1522,13 @@ class OrderExecutor:
         price = tick.ask if direction == "BUY" else tick.bid
 
         request = self._build_request(order_type, lot, price)
-
-        # Si on a deja trouve un filling qui marche, envoyer direct
-        if self.filling_type is not None:
-            result = mt5.order_send(request)
-        else:
-            result = self._send_with_retry(request, f"OPEN {direction}")
+        result = mt5.order_send(request)
 
         if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
             logger.info(f"OUVERT {direction} | Lot={lot} | Prix={price:.2f} | Ticket={result.order}")
             return True
 
-        # Echec final
+        # Echec
         if result is None:
             err = mt5.last_error()
             logger.error(f"ECHEC {direction} | order_send=None | last_error={err}")
@@ -1522,11 +1558,7 @@ class OrderExecutor:
         price = tick.bid if pos.type == 0 else tick.ask
 
         request = self._build_request(order_type, pos.volume, price, pos.ticket)
-
-        if self.filling_type is not None:
-            result = mt5.order_send(request)
-        else:
-            result = self._send_with_retry(request, "CLOSE")
+        result = mt5.order_send(request)
 
         if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
             logger.info(f"FERME | Raison: {reason} | Profit: {pos.profit:.2f}$")
@@ -1795,10 +1827,12 @@ def main():
     print(f"  Lot     : {initial_lot:.2f} (dynamique: {LOT_PER_100} par 100$, max {LOT_MAX})")
     print(f"  Risque  : max {RISK_PERCENT}% du solde par trade")
     print(f"  Score   : >= {SCORE_MIN_ENTRY} (entree)")
-    print(f"  MODE 1  : BREAKOUT (cassure structure + volume, stop {STOP_LOSS_MAX}$)")
-    print(f"  MODE 2  : EXTREME RSI (BUY<={RSI_BUY_1} SELL>={RSI_SELL_1}, stop {STOP_LOSS_EXT}$)")
-    print(f"  Sortie  : Trailing dynamique + RSI confirme (PAS de TP fixe)")
-    print(f"  Trailing: 4$=35% | 8$=50% | 12$=65% du max vu")
+    print(f"  MODE    : TREND-FOLLOWING SCALP (pullback dans le trend)")
+    print(f"  Entree  : EMA9>EMA21 + RSI pullback + RSI rebondit")
+    print(f"  TP      : {SCALP_TP}$ | STOP: {STOP_LOSS_MAX}$ (spread-aware)")
+    print(f"  Spread  : max {MAX_SPREAD_USD}$ (~{MAX_SPREAD_USD*0.05:.1f}$ cout/trade)")
+    print(f"  Trailing: demarre a +{SCALP_TRAIL_START}$, trail {SCALP_TRAIL_DIST}$ derriere max")
+    print(f"  Sortie  : Trailing + Trend reversal (apres {SCALP_TREND_REV_DELAY}s) + Timeout {SCALP_MAX_HOLD}s")
     print(f"  Post-SL : attente RSI zone {RSI_NEUTRAL_LOW}-{RSI_NEUTRAL_HIGH} avant re-entry")
     print(f"  Boucle  : {LOOP_INTERVAL}s")
     print("-" * 58)
@@ -1952,6 +1986,12 @@ def main():
                 # Check 1: Session arretee
                 elif risk_mgr.session_stopped:
                     print(f"\n  SESSION ARRETEE: perte limite {DAILY_LOSS_LIMIT}$ atteinte")
+
+                # Check 1b: PAUSE 4H apres 2 pertes consecutives
+                # EXCEPTION: score >= 150 = opportunite rare, on passe quand meme!
+                elif risk_mgr.is_pause_active(signal.score)[0]:
+                    _, pause_msg = risk_mgr.is_pause_active(signal.score)
+                    print(f"\n  {pause_msg}")
 
                 # Check 2: Post-SL RSI reset (correction en cours)
                 elif risk_mgr.is_rsi_reset_blocking()[0]:
